@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from itertools import product
 from scipy.stats import truncnorm
+from pyscipopt import Model
 
 from LP_construction import *
 SEED = 2026

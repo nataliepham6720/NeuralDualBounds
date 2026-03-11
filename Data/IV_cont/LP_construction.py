@@ -62,7 +62,7 @@ def latent_types(k):
     return T_types, Y_types
 
 
-def build_system(P,k):
+def build_constraints(P,k):
 
     T_types,Y_types = latent_types(k)
     n_latent = len(T_types)*len(Y_types)
