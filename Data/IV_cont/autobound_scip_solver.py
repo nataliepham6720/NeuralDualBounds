@@ -5,7 +5,11 @@ from scipy.stats import truncnorm
 from pyscipopt import Model
 
 from LP_construction import *
+
 SEED = 2026
+
+np.random.seed(SEED)
+# torch.manual_seed(SEED)
 
 def solve_lp_scip(c, A, b, eps=1e-6):
 
@@ -45,14 +49,14 @@ def solve_lp_scip(c, A, b, eps=1e-6):
 # ============================================================
 # 8. Run Experiment (Matches Table 3)
 # ============================================================
-n = 5000
-lam = np.random.rand()
+n = 10000
+lam = 0.5 # np.random.rand()
 
 data = generate_data(n, lam)
 P = empirical_distribution(data, k=8)
 
-A, b = build_constraints(P, k=8)
-c = ate_vector(k=8)
+A, b, c, labels = build_constraints(P, k=8)
+# c = ate_vector(k=8)
 
 lower, upper = solve_lp_scip(c, A, b)
 
