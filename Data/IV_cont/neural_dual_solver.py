@@ -25,6 +25,8 @@ class DualNet(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(3,h),
             nn.Tanh(),
+            # nn.Linear(h,h),
+            # nn.Tanh(),
             nn.Linear(h,2),
         )
         self.apply(init_weights)
@@ -32,9 +34,15 @@ class DualNet(nn.Module):
     def forward(self,x):
         out = self.net(x)        # (N,2)
 
-        lam_pos = torch.nn.functional.softplus(out[:,0])
-        lam_neg = torch.nn.functional.softplus(out[:,1])
+        lam_pos = out[:,0] # torch.nn.functional.softplus(out[:,0])
+        lam_neg = out[:,1] # torch.nn.functional.softplus(out[:,1])
+        
+        # lam_pos = torch.nn.functional.softplus(out[:,0])
+        # lam_neg = torch.nn.functional.softplus(out[:,1])
 
+        # lam_pos = torch.clamp(lam_pos,min=0)
+        # lam_neg = torch.clamp(lam_neg,min=0)
+        
         return lam_pos, lam_neg
 
 class DualNet2(nn.Module):
@@ -75,7 +83,7 @@ class DualModel(nn.Module):
     def __init__(self,h=6):
         super().__init__()
 
-        self.shared_net = DualNet2(h)
+        self.shared_net = DualNet(h)
         self.log_scale = nn.Parameter(torch.tensor(-0.5))
 
         self.nu_raw = nn.Parameter(torch.tensor(0.0))
@@ -121,9 +129,10 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5):
     print("Compression ratio: {:.2f}x".format(len(b)/count_params(model)))
 
     optimizer=torch.optim.AdamW(model.parameters(),lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
     model.nu_raw.data.fill_(0.0)
 
-    mu=0.1
+    mu=1
 
 
     for step in range(steps):
@@ -131,34 +140,41 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5):
 
       lam_pos,lam_neg,nu_raw=model(feats)
       lam=lam_pos-lam_neg
-      lam = torch.where(torch.abs(lam) < 1e-4, torch.zeros_like(lam), lam)
+      # lam = torch.where(torch.abs(lam) < 1e-4, torch.zeros_like(lam), lam)
 
       nu_max = torch.min(c - (A_obs.t() @ lam))
       nu = nu_max - torch.nn.functional.softplus(nu_raw)
 
       slack = c-(A_obs.t()@lam+nu)
-      if slack.min().item() < EPS_TOL*1e-2:
+      if slack.min().item() < EPS_TOL**2:
+        print(slack.min().item())
         break
 
-      barrier=-mu*torch.mean(torch.log(slack))
-      slack_reg = 0.01 * torch.mean(slack**2)
+      if upper:
+        tau = 0.01
+        barrier = mu * torch.logsumexp(-slack / tau, dim=0)
+      else: 
+        barrier=-mu*torch.mean(torch.log(slack))
+      # slack_reg = 0.01 * torch.mean(slack**2)
       lam_abs = lam_pos + lam_neg
       sparse_reg = 0.01 * torch.mean(lam_abs)
-      dual_slack = A_obs @ slack
+      # dual_slack = A_obs @ slack
 
-      cs_reg = 0.01 * torch.mean(torch.abs(lam * dual_slack))
+      # cs_reg = 0.01 * torch.mean(torch.abs(lam * dual_slack))
       # barrier=-mu*torch.sum(1/slack)
+
+      # k = 512
+      # idx = torch.topk(-slack, k).indices
+      # loss = dual_obj + mu * slack[idx].mean()
 
       dual_obj=(b_obs+EPS_TOL)@lam_pos-(b_obs-EPS_TOL)@lam_neg+nu
       # dual_obj = b_obs @ (lam_pos - lam_neg) + nu
 
-      loss= -dual_obj  + sparse_reg #+ barrier + slack_reg + cs_reg
+      loss= -dual_obj + sparse_reg + barrier #+ slack_reg + cs_reg
       loss.backward()
 
       torch.nn.utils.clip_grad_norm_(model.parameters(),1.5)
       optimizer.step()
-
-      mu *= 0.998
 
       if step%1000==0:
           smallest5 = torch.topk(slack, 5, largest=False).values
@@ -169,6 +185,7 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5):
               f"max slack {slack.max().item():.6f} | "
               f"top5 smallest {smallest5.detach().cpu().numpy()}"
           )
+          mu *= 0.998
 
     tol = 1e-2
     num_zero = torch.sum(slack < tol).item()
@@ -183,7 +200,7 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5):
 
 
 if __name__=="__main__":
-    n=40000
+    n=100000
     n_pts = 10000
     k=8
 
