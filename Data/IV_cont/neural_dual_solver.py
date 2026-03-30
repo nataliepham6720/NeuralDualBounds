@@ -13,7 +13,7 @@ import wandb
 from LP_construction import * 
 from utils import *
 
-SEED = 2027
+SEED = 2020
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -27,10 +27,12 @@ class DualNet(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(3,h),
+            nn.LayerNorm(h),
             nn.Tanh(),
             # nn.Linear(h,h),
             # nn.Tanh(),
             nn.Linear(h,2),
+            # nn.Tanh(),
         )
         self.apply(init_weights)
 
@@ -104,21 +106,25 @@ def count_params(model):
 # ============================================================
 
 def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5,name="Run1"):
+    if wandb.run is not None:
+        wandb.finish()
+
     if upper == False:
-      name = name + "UpperBound"
+      name = name + "_LowerBound"
     else:
-      name = name + "LowerBound"
+      name = name + "_UpperBound"
     wandb.init(
         project="neural-dual-lp",
         name=name,
-        config={"steps": steps, "lr": lr, "k": k}
+        config={"steps": steps, "lr": lr, "k": k},
+        reinit=True,
     )
 
     active_history = []
     
     device="cuda" if torch.cuda.is_available() else "cpu"
 
-    sign=-1 if upper else 1
+    sign=1 if upper else -1
     c=sign*c
 
     A=torch.tensor(A,dtype=torch.float32,device=device)
@@ -129,6 +135,7 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5,name="Run1"):
 
     feats=torch.tensor(
         [[z/(k-1),2*t-1,y/(k-1)] for z,t,y in labels[:-1]],
+        # [[z,t,y] for z,t,y in labels[:-1]],
         dtype=torch.float32,
         device=device
     )
@@ -143,7 +150,7 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5,name="Run1"):
     print("Compression ratio: {:.2f}x".format(len(b)/count_params(model)))
 
     optimizer=torch.optim.AdamW(model.parameters(),lr=lr)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
     model.nu_raw.data.fill_(0.0)
 
     mu=1
@@ -154,72 +161,32 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5,name="Run1"):
 
       lam_pos,lam_neg,nu_raw=model(feats)
       lam=lam_pos-lam_neg
-      lam = torch.where(torch.abs(lam) < 1e-4, torch.zeros_like(lam), lam)
+      # lam = torch.where(torch.abs(lam) < 1e-4, torch.zeros_like(lam), lam)
 
-      # nu_max = torch.min(c - (A_obs.t() @ lam))
-      # nu = nu_max - torch.nn.functional.softplus(nu_raw)
-      if upper:
-        tau = 0.005
-        nu = -tau * torch.logsumexp(-(c - (A_obs.t() @ lam)) / tau, dim=0)
+      nu_max = torch.min(c - (A_obs.t() @ lam))
+      nu = nu_max - torch.nn.functional.softplus(nu_raw)
+      # tau = 0.01
+      # nu = -tau * torch.logsumexp(-(c - (A_obs.t() @ lam)) / tau, dim=0)
+      slack = c-(A_obs.t()@lam+nu)
+      if slack.min().item() < EPS_TOL**2:
+        print(slack.min().item())
+        break
+
+      # barrier=-mu*torch.mean(torch.log(slack))
+      violation = torch.relu(-(c - (A_obs.t() @ lam + nu)))
+      penalty = 1 * violation.mean()
+
+      dual_obj=(b_obs+EPS_TOL)@lam_pos-(b_obs-EPS_TOL)@lam_neg+nu
+
+      loss= -dual_obj + mu*penalty
+      loss.backward()
+
+      torch.nn.utils.clip_grad_norm_(model.parameters(),1)
+      scheduler.step()
+      optimizer.step()
       
-        slack = c-(A_obs.t()@lam+nu)
-        if slack.min().item() < EPS_TOL**2:
-          print(slack.min().item())
-          break
-
-        barrier=-mu*torch.mean(torch.log(slack))
-        # slack_reg = 0.01 * torch.mean(slack**2)
-        lam_abs = lam_pos + lam_neg
-        sparse_reg = 0.01 * torch.mean(lam_abs)
-        # dual_slack = A_obs @ slack
-
-        # cs_reg = 0.01 * torch.mean(torch.abs(lam * dual_slack))
-        # barrier=-mu*torch.sum(1/slack)
-
-        # k = 512
-        # idx = torch.topk(-slack, k).indices
-        # min_slack = mu * slack[idx].mean()
-        # slack_var = 0.01 * torch.var(slack)
-        violation = torch.relu(-(c - (A_obs.t() @ lam + nu)))
-        penalty = 100 * violation.mean()
-
-        dual_obj=(b_obs+EPS_TOL)@lam_pos-(b_obs-EPS_TOL)@lam_neg+nu
-        # dual_obj = b_obs @ (lam_pos - lam_neg) + nu
-
-        loss= -dual_obj + penalty #+ barrier + min_slack # + sparse_reg  + slack_reg + cs_reg
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(),1)
-        optimizer.step()
-        
-        mu *= 0.998
-      else:
-        # print("Optimize lower bound")
-        tau = 0.01
-        nu_max = torch.min(c - (A_obs.t() @ lam))
-        nu = nu_max - torch.nn.functional.softplus(nu_raw)
-        # nu = -tau * torch.logsumexp(-(c - (A_obs.t() @ lam)) / tau, dim=0)
-      
-        slack = c-(A_obs.t()@lam+nu)
-        if slack.min().item() < EPS_TOL**2:
-          print(slack.min().item())
-          break
-
-        # barrier=-mu*torch.mean(torch.log(slack))
-        lam_abs = lam_pos + lam_neg
-        sparse_reg = 0.01 * torch.mean(lam_abs)
-        violation = torch.relu(-(c - (A_obs.t() @ lam + nu)))
-        penalty = mu * violation.mean()
-
-        dual_obj=(b_obs+EPS_TOL)@lam_pos-(b_obs-EPS_TOL)@lam_neg+nu
-
-        loss= -dual_obj + penalty # + sparse_reg  #+ slack_reg + cs_reg
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(),1)
-        optimizer.step()
-        
-        mu *= 0.998
+      # mu *= 0.998
+      mu = min(mu * 1.002, 100)
 
 
       
@@ -231,16 +198,22 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5,name="Run1"):
                           "mean_slack": slack.mean().item(), 
                           "num_active": (slack < 1e-2).sum().item(),
                           "loss": loss.item(), })
-              vals, idx = torch.topk(slack, K_active, largest=False) 
-              topk_idx = idx.detach().cpu().numpy() 
-              topk_vals = vals.detach().cpu().numpy() 
-              active_history.append(set(topk_idx)) 
-              # log table 
-              table = wandb.Table(columns=["rank","z","t","y","slack"]) 
-              for i,j in enumerate(topk_idx): 
-                z,t,y = labels[j] 
-                table.add_data(i,int(z),int(t),int(y),float(topk_vals[i])) 
-              wandb.log({"active_constraints": table})
+              # k_active = min(K_active, slack.shape[0])
+              # vals, idx = torch.topk(slack, k_active, largest=False)
+
+              # topk_idx = idx.detach().cpu().numpy()
+              # topk_vals = vals.detach().cpu().numpy()
+
+              # active_history.append(set(topk_idx))
+
+              # table = wandb.Table(columns=["rank","z","t","y","slack"])
+
+              # labels_obs = labels[:-1]
+
+              # for i, j in enumerate(topk_idx):
+              #     table.add_data(i, int(j), "-", "-", float(topk_vals[i]))
+
+              # wandb.log({"active_constraints": table})
           
           smallest5 = torch.topk(slack, 5, largest=False).values
 
@@ -258,16 +231,17 @@ def solve_dual_nn(A,b,c,labels,k,upper=False,steps=3000,lr=1e-5,name="Run1"):
     print(f'no. of near-zero slack constraints: {num_zero}/{slack.numel()}')
     dual_value=dual_obj.item()
 
-    if upper:
+    if upper==True:
         dual_value=-dual_value
 
     return lam_pos.detach().cpu().numpy(), lam_neg.detach().cpu().numpy(), nu.item()
 
 
 if __name__=="__main__":
-    n=50000
+    n=100000
     n_pts = 10000
     k=10
+    name = "h=10_noLayers=1_k=10"
 
     print("Generating data...")
     data = generate_data(n_pts,0.5)
@@ -291,14 +265,14 @@ if __name__=="__main__":
     print("\nTraining neural dual...")
     start = time.time()
 
-    # lamL_pos, lamL_neg, nuL=solve_dual_nn(A,b,c,labels,k,upper=False,lr=5e-3,steps=n)
-    # print("nu ", nuL)
-    lamU_pos, lamU_neg,nuU=solve_dual_nn(A,b,c,labels,k,upper=True,lr=5e-4,steps=n)
+    lamL_pos, lamL_neg, nuL=solve_dual_nn(A,b,c,labels,k,upper=False,lr=5e-3,steps=n,name=name)
+    print("nu ", nuL)
+    lamU_pos, lamU_neg, nuU=solve_dual_nn(A,b,c,labels,k,upper=True,lr=5e-4,steps=n,name=name)
     print("nu ", nuU)
 
     b_obs = b[:-1]
-    # lower=(b_obs+EPS_TOL)@lamL_pos-(b_obs-EPS_TOL)@lamL_neg+nuL
-    upper=-((b_obs+EPS_TOL)@lamU_pos-(b_obs-EPS_TOL)@lamU_neg+nuU)
+    lower=-((b_obs+EPS_TOL)@lamL_pos-(b_obs-EPS_TOL)@lamL_neg+nuL)
+    upper=((b_obs+EPS_TOL)@lamU_pos-(b_obs-EPS_TOL)@lamU_neg+nuU)
 
     # lower,upper=min(lower,upper),max(lower,upper)
     end = time.time()

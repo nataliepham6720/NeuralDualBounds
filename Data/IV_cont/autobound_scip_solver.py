@@ -3,10 +3,11 @@ import matplotlib.pyplot as plt
 from itertools import product
 from scipy.stats import truncnorm
 from pyscipopt import Model
+import time
 
 from LP_construction import *
 
-SEED = 2026
+SEED = 2020
 
 np.random.seed(SEED)
 # torch.manual_seed(SEED)
@@ -57,11 +58,14 @@ P = empirical_distribution(data, k=8)
 
 A, b, c, labels = build_constraints(P, k=8)
 # c = ate_vector(k=8)
-
+start = time.time()
 lower, upper = solve_lp_scip(c, A, b)
+end = time.time()
 
 print("\n==============================")
 print("ATE LOWER:", lower)
 print("ATE UPPER:", upper)
 print("TRUE ATE = 3")
 print("==============================")
+
+print("Time taken: ", end-start)
