@@ -40,8 +40,9 @@ def solve_lp_scip(c, A, b, eps=1e-6):
             raise RuntimeError("SCIP infeasible — discretization too coarse")
 
         return m.getObjVal()
-
+    print("Solve lower bound")
     lower = solve_sense("minimize")
+    print("Solve upper bound")
     upper = solve_sense("maximize")
 
     return lower, upper
@@ -52,11 +53,13 @@ def solve_lp_scip(c, A, b, eps=1e-6):
 # ============================================================
 n = 10000
 lam = 0.5 # np.random.rand()
+k=10
+print(f"Discretize into {k} bins")
 
 data = generate_data(n, lam)
-P = empirical_distribution(data, k=8)
+P = empirical_distribution(data, k=k)
 
-A, b, c, labels = build_constraints(P, k=8)
+A, b, c, labels = build_constraints(P, k=k)
 # c = ate_vector(k=8)
 start = time.time()
 lower, upper = solve_lp_scip(c, A, b)

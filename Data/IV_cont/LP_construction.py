@@ -7,7 +7,7 @@ from scipy.stats import truncnorm
 # Continuous IV Data Generator
 # ============================================================
 
-def generate_data(n, lam):
+def generate_data_IV(n, lam):
     def mix_noise():
         return lam * truncnorm.rvs(-1,1,size=(n,1)) + \
                (1-lam) * np.random.uniform(-1,1,(n,1))
@@ -34,7 +34,7 @@ def discretize(x,k):
 # Empirical P(T,Y | Z)
 # ============================================================
 
-def empirical_distribution(data,k):
+def empirical_distribution_IV(data,k):
     Zb = discretize(data[:,0],k)
     T  = data[:,1].astype(int)
     Yb = discretize(data[:,2],k)
@@ -62,7 +62,7 @@ def latent_types(k):
     return T_types, Y_types
 
 
-def build_constraints(P,k):
+def build_constraints_IV(P,k):
 
     T_types,Y_types = latent_types(k)
     n_latent = len(T_types)*len(Y_types)
