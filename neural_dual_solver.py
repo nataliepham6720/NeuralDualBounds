@@ -233,7 +233,7 @@ if __name__ == "__main__":
     if name == "IV_cont":
         name = name + f"_k{k}_steps{n}_lrL{args.lr_lower}_lrU{args.lr_upper}_hidden{args.hidden}_layers{args.layers}"
         print("Generating data...")
-        data = generate_data_IV(n_pts, lambd=0.5)
+        data = generate_data_IV(n_pts, lam=0.5)
 
         print("Estimating distribution...")
         P = empirical_distribution_IV(data, k)
@@ -276,10 +276,16 @@ if __name__ == "__main__":
     end = time.time()
 
     print("\n===== BOUNDS =====")
-    print(f"NN lower bound : {lower:.4f}")
-    print(f"NN upper bound : {upper:.4f}")
-    print("True ATE = 3")
-    print("Time taken: ", end-start)
+    if name == "Edu_vs_Voting":
+        print(f"NN lower bound : {lower:.4f}")
+        print(f"NN upper bound : {upper:.4f}")
+        # print("True ATE = 0.25")
+    elif name == "IV_cont":
+        print(f"NN lower bound : {lower:.4f}")
+        print(f"NN upper bound : {upper:.4f}")
+        print("True ATE = 3")
 
-    plot_dual_heatmap(lamL_pos-lamL_neg, labels[:-1], k, "Lower Bound Dual")
-    plot_dual_heatmap(lamU_pos-lamU_neg, labels[:-1], k, "Upper Bound Dual")
+        plot_dual_heatmap(lamL_pos-lamL_neg, labels[:-1], k, "Lower Bound Dual")
+        plot_dual_heatmap(lamU_pos-lamU_neg, labels[:-1], k, "Upper Bound Dual")
+    
+    print("Time taken: ", end-start)

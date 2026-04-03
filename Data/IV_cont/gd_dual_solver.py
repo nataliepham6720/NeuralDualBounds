@@ -213,10 +213,10 @@ if __name__=="__main__":
     n = 200000
     k = 8
 
-    data = generate_data(n, lam=0.5) #np.random.rand())
-    P = empirical_distribution(data,k)
+    data = generate_data_IV(n, lam=0.5) #np.random.rand())
+    P = empirical_distribution_IV(data,k)
 
-    A,b,c,labels = build_constraints(P,k)
+    A,b,c,labels = build_constraints_IV(P,k)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("Dual variables:", len(b))

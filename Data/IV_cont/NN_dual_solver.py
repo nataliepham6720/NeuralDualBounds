@@ -246,14 +246,13 @@ if __name__=="__main__":
     name = "h=5_noLayers=2_k=10"
 
     print("Generating data...")
-    data = generate_data(n_pts,0.5)
+    data = generate_data_IV(n_pts,0.5)
 
     print("Estimating distribution...")
-    P = empirical_distribution(data,k)
+    P = empirical_distribution_IV(data,k)
 
     print("Building LP system...")
-    A,b,c,labels=build_constraints(P,k)
-
+    A,b,c,labels=build_constraints_IV(P,k)
 
     print("\n===== SIZE CHECK =====")
 
