@@ -14,6 +14,9 @@ import wandb
 from Data.IV_cont.LP_construction import * 
 from Data.IV_cont.utils import *
 
+from Data.Edu_vs_Voting.LP_construction import * 
+# from Data.Edu_vs_Voting.utils import *
+
 SEED = 2020
 
 np.random.seed(SEED)
@@ -117,7 +120,7 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def solve_dual_nn(A, b, c, labels, k, upper=False, steps=3000, lr=1e-5, name="Run1", hidden=5, layers=2):
+def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, lr=1e-5, name="Run1", hidden=5, layers=2):
     if wandb.run is not None:
         wandb.finish()
 
@@ -138,17 +141,27 @@ def solve_dual_nn(A, b, c, labels, k, upper=False, steps=3000, lr=1e-5, name="Ru
     sign = 1 if upper else -1
     c = sign * c
 
+    if "IV_cont" in name:
+        feats = torch.tensor(
+            [[z/(k-1), 2*t-1, y/(k-1)] for z, t, y in labels[:-1]],
+            dtype=torch.float32,
+            device=device
+        )
+    elif "Edu_vs_Voting" in name:
+      obs_tuples = [(x, d, y) for x in range(kx) for d in [0,1] for y in range(ky)]
+      feats = torch.tensor([[x / (kx - 1), # normalize X
+                              2 * d - 1,   # map {0,1} → {-1,1}
+                              y_centers[y] # observed Y
+                            ]
+                    for (x, d, y) in obs_tuples],
+                    dtype=torch.float32,
+                    device=device)
+
     A = torch.tensor(A, dtype=torch.float32, device=device)
     A_obs = A[:-1]
     b = torch.tensor(b, dtype=torch.float32, device=device)
     b_obs = b[:-1]
     c = torch.tensor(c, dtype=torch.float32, device=device)
-
-    feats = torch.tensor(
-        [[z/(k-1), 2*t-1, y/(k-1)] for z, t, y in labels[:-1]],
-        dtype=torch.float32,
-        device=device
-    )
 
     model = DualModel(h=hidden, num_layers=layers).to(device)
 
@@ -231,7 +244,7 @@ if __name__ == "__main__":
     name = args.name
 
     if name == "IV_cont":
-        name = name + f"_k{k}_steps{n}_lrL{args.lr_lower}_lrU{args.lr_upper}_hidden{args.hidden}_layers{args.layers}"
+        wandb_name = name + f"_k{k}_steps{n}_lrL{args.lr_lower}_lrU{args.lr_upper}_hidden{args.hidden}_layers{args.layers}"
         print("Generating data...")
         data = generate_data_IV(n_pts, lam=0.5)
 
@@ -240,6 +253,24 @@ if __name__ == "__main__":
 
         print("Building LP system...")
         A, b, c, labels = build_constraints_IV(P, k)
+        y_centers = None
+
+    elif name == "Edu_vs_Voting":
+        wandb_name = name + f"_k{k}_steps{n}_lrL{args.lr_lower}_lrU{args.lr_upper}_hidden{args.hidden}_layers{args.layers}"
+
+        kx = ky = args.k
+
+        print("Generating data...")
+        data, Y0, Y1 = generate_data_EV(n_pts, tau=0.5, seed=SEED)
+        ATE_true = np.mean(Y1 - Y0)
+        print("True ATE:", ATE_true)
+
+        print("Estimating distribution...")
+        P, x_bins, y_bins = empirical_distribution_EV(data, kx, ky)
+        y_centers = (y_bins[:-1] + y_bins[1:]) / 2 
+
+        print("Building LP system...")
+        A, b, c, labels = build_constraints_EV(P, kx, ky, y_bins)
 
     print("\n===== SIZE CHECK =====")
     print("A shape:", A.shape)
@@ -251,20 +282,22 @@ if __name__ == "__main__":
 
     lamL_pos, lamL_neg, nuL = solve_dual_nn(
         A, b, c, labels, k,
+        y_centers=y_centers,
         upper=False,
         lr=args.lr_lower,
         steps=n,
-        name=name,
+        name=wandb_name,
         hidden=args.hidden,
         layers=args.layers
     )
 
     lamU_pos, lamU_neg, nuU = solve_dual_nn(
         A, b, c, labels, k,
+        y_centers=y_centers,
         upper=True,
         lr=args.lr_upper,
         steps=n,
-        name=name,
+        name=wandb_name,
         hidden=args.hidden,
         layers=args.layers
     )
@@ -279,7 +312,7 @@ if __name__ == "__main__":
     if name == "Edu_vs_Voting":
         print(f"NN lower bound : {lower:.4f}")
         print(f"NN upper bound : {upper:.4f}")
-        # print("True ATE = 0.25")
+        # print("True ATE = 0.5")
     elif name == "IV_cont":
         print(f"NN lower bound : {lower:.4f}")
         print(f"NN upper bound : {upper:.4f}")

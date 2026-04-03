@@ -56,10 +56,10 @@ lam = 0.5 # np.random.rand()
 k=10
 print(f"Discretize into {k} bins")
 
-data = generate_data(n, lam)
-P = empirical_distribution(data, k=k)
+data = generate_data_IV(n, lam)
+P = empirical_distribution_IV(data, k=k)
 
-A, b, c, labels = build_constraints(P, k=k)
+A, b, c, labels = build_constraints_IV(P, k=k)
 # c = ate_vector(k=8)
 start = time.time()
 lower, upper = solve_lp_scip(c, A, b)

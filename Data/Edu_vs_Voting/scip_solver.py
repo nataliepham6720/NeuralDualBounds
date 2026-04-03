@@ -49,15 +49,20 @@ def solve_lp_scip(c, A, b, eps=1e-6):
 # ============================================================
 
 n_pts = 10000
-k = 4
+kx = 12
+ky = 12
 
-data, Y0, Y1 = generate_data(n_pts, tau=0.5, seed=SEED)
+data, Y0, Y1 = generate_data_EV(n_pts, tau=0.5, seed=SEED)
 ATE_true = np.mean(Y1 - Y0)
 print("True ATE:", ATE_true)
 
-P = empirical_distribution(data, k=k)
+P, x_bins, y_bins = empirical_distribution_EV(data, kx, ky) 
+A, b, c, labels = build_constraints_EV(P, kx, ky, y_bins)
 
-A, b, c, labels = build_constraints(P, k=k)
+print("A shape:", A.shape) 
+print("b shape:", b.shape) 
+print("c shape:", c.shape) 
+print("Number of variables:", len(c))
 
 start = time.time()
 lower, upper = solve_lp_scip(c, A, b)
