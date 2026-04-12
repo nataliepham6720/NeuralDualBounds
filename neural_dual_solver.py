@@ -10,17 +10,14 @@ import torch.optim as optim
 import copy
 import time
 import wandb
+import osqp
+import scipy.sparse as sp
 
 from Data.IV_cont.LP_construction import * 
 from Data.IV_cont.utils import *
 
 from Data.Edu_vs_Voting.LP_construction import * 
 # from Data.Edu_vs_Voting.utils import *
-
-SEED = 2020
-
-np.random.seed(SEED)
-torch.manual_seed(SEED)
 
 EPS_TOL = 1e-6
 K_active = 10
@@ -30,6 +27,7 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--name", type=str, default="experiment") # IV_cont or Edu_vs_Voting
+    parser.add_argument("--distribution_gen", type=str, default="generate")
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--hidden", type=int, default=5)
     parser.add_argument("--layers", type=int, default=2)
@@ -39,9 +37,15 @@ def get_args():
     parser.add_argument("--lr_upper", type=float, default=5e-4)
 
     parser.add_argument("--n_pts", type=int, default=10000)
-
+    parser.add_argument("--seed", type=int, default=2020)
     return parser.parse_args()
 
+
+SEED = 2020
+print("Seed:", SEED)
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 class DualNet(nn.Module):
     def __init__(self, h=10, num_layers=2):
@@ -116,6 +120,39 @@ class DualModel(nn.Module):
         return lam_pos, lam_neg, self.nu_raw
 
 
+def project_lambda_qp(lam_np, A_np, c_np, nu):
+    """
+    Solve:
+        min 1/2 ||λ - λ0||^2
+        s.t. A^T λ <= c - nu
+    """
+
+    n = lam_np.shape[0]
+
+    # P = I
+    P = sp.eye(n, format='csc')
+
+    # q = -λ0
+    q = -lam_np
+
+    # Constraints: A^T λ <= c - nu
+    G = A_np.T  # shape (m, n)
+
+    l = -np.inf * np.ones(G.shape[0])
+    u = c_np - nu
+
+    G = sp.csc_matrix(G)
+
+    prob = osqp.OSQP()
+    prob.setup(P=P, q=q, A=G, l=l, u=u, verbose=False)
+
+    res = prob.solve()
+
+    if res.info.status != 'solved':
+        print("⚠️ QP projection did not fully solve:", res.info.status)
+
+    return res.x
+
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -130,7 +167,7 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, l
         name = name + "_UpperBound"
 
     wandb.init(
-        project="neural-dual-lp",
+        project="NeuralDualSolver",
         name=name,
         config={"steps": steps, "lr": lr, "k": k},
         reinit=True,
@@ -186,9 +223,9 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, l
         nu = nu_max - torch.nn.functional.softplus(nu_raw)
 
         slack = c - (A_obs.t() @ lam + nu)
-        if slack.min().item() < EPS_TOL**2:
-            print(slack.min().item())
-            break
+        # if slack.min().item() < EPS_TOL**2:
+        #     print(slack.min().item())
+        #     break
 
         violation = torch.relu(-(c - (A_obs.t() @ lam + nu)))
         penalty = 1 * violation.mean()
@@ -201,6 +238,48 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, l
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
         scheduler.step()
         optimizer.step()
+
+        violation_mask = slack < 0
+
+        if violation_mask.any():
+            print("\n--- Exact QP Projection ---")
+
+            # BEFORE
+            min_slack_before = slack.min().item()
+            print(f"Min slack BEFORE: {min_slack_before:.6e}")
+
+            lam_np = lam.detach().cpu().numpy()
+            A_np = A_obs.detach().cpu().numpy()
+            c_np = c.detach().cpu().numpy()
+            nu_val = nu.item()
+
+            # Solve projection
+            lam_proj_np = project_lambda_qp(lam_np, A_np, c_np, nu_val)
+
+            # back to torch
+            lam_proj = torch.tensor(lam_proj_np, dtype=torch.float32, device=device)
+
+            # update lam_pos / lam_neg
+            lam_pos.copy_(torch.clamp(lam_proj, min=0))
+            lam_neg.copy_(torch.clamp(-lam_proj, min=0))
+
+            # AFTER → recompute slack
+            lam_new = lam_pos - lam_neg
+
+            nu_max = torch.min(c - (A_obs.t() @ lam_new))
+            nu = nu_max - torch.nn.functional.softplus(nu_raw)
+
+            slack_after = c - (A_obs.t() @ lam_new + nu)
+
+            print(f"Min slack AFTER:  {slack_after.min().item():.6e}")
+            print(f"#violations AFTER: {(slack_after < -1e-8).sum().item()}")
+
+            if (slack_after < -1e-8).any():
+                print("⚠️ Still slight violation (numerical tolerance)")
+            else:
+                print("✅ Fully feasible after projection")
+
+            print("--- End QP Projection ---\n")
 
         mu = min(mu * 1.002, 100)
 
@@ -237,26 +316,32 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, l
 
 if __name__ == "__main__":
     args = get_args()
-
+    
     n = args.steps
     n_pts = args.n_pts
     k = args.k
     name = args.name
+    dist = args.distribution_gen
 
     if name == "IV_cont":
-        wandb_name = name + f"_k{k}_steps{n}_lrL{args.lr_lower}_lrU{args.lr_upper}_hidden{args.hidden}_layers{args.layers}"
-        print("Generating data...")
-        data = generate_data_IV(n_pts, lam=0.5)
+        wandb_name = name + f"_k{k}_steps{n}_hidden{args.hidden}_layers{args.layers}"
+        
+        if dist == "generate":
+            print("Generating data...")
+            data = generate_data_IV(n_pts, lam=0.5)
 
-        print("Estimating distribution...")
-        P = empirical_distribution_IV(data, k)
+            print("Estimating distribution...")
+            P = empirical_distribution_IV(data, k)
+        elif dist == "pre-load":
+            print("Loading saved distribution...")
+            P = np.load("./Data/IV_cont/P8.npy")
 
         print("Building LP system...")
         A, b, c, labels = build_constraints_IV(P, k)
         y_centers = None
 
     elif name == "Edu_vs_Voting":
-        wandb_name = name + f"_k{k}_steps{n}_lrL{args.lr_lower}_lrU{args.lr_upper}_hidden{args.hidden}_layers{args.layers}"
+        wandb_name = name + f"_k{k}_steps{n}_hidden{args.hidden}_layers{args.layers}"
 
         kx = ky = args.k
 
