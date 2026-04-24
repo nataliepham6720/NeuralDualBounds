@@ -91,7 +91,7 @@ def build_constraints_IV(P,k):
     # normalization constraint
     A.append(np.ones(n_latent))
     b.append(1.0)
-    labels.append(("norm",0,0))
+    labels.append((-1,-1,-1))
 
     c=[Yt[1]-Yt[0] for Tt in T_types for Yt in Y_types]
 
