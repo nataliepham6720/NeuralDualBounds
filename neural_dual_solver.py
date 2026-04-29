@@ -22,6 +22,9 @@ from Data.Edu_vs_Voting.LP_construction import *
 EPS_TOL = 0 #1e-6
 K_active = 10
 
+SLACK_TOL = 1e-4
+NU_TOL = 1e-9
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -41,7 +44,7 @@ def get_args():
     return parser.parse_args()
 
 
-SEED = 2020
+SEED = 2022
 print("Seed:", SEED)
 
 np.random.seed(SEED)
@@ -118,6 +121,18 @@ class DualModel(nn.Module):
     def forward(self, feats):
         lam_pos, lam_neg = self.shared_net(feats)
         return lam_pos, lam_neg # , self.nu_raw
+
+class DualModel2(nn.Module):
+    def __init__(self, h=6, num_layers=2):
+        super().__init__()
+
+        self.shared_net = DualNet(h, num_layers)
+        self.log_scale = nn.Parameter(torch.tensor(-0.5))
+        self.nu_raw = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, feats):
+        lam_pos, lam_neg = self.shared_net(feats)
+        return lam_pos, lam_neg, self.nu_raw
 
 
 def project_lambda_qp(lam_np, A_np, c_np, nu):
@@ -228,7 +243,7 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
     lam_star = lam.detach().clone()  # interior target for warm start
 
     # ---------- Build neural model for lam ----------
-    model = DualModel(h=hidden, num_layers=layers).to(device)
+    model = DualModel2(h=hidden, num_layers=layers).to(device)
     print("Neural network parameters:", count_params(model))
     print("Compression ratio: {:.2f}x".format(len(b) / count_params(model)))
 
@@ -245,11 +260,11 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
         optimizer_warm.step()
 
     # ---------- Phase 2: central path on NN parameters ----------
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
 
     mu = 1.0
-    max_mu = 1e-2
+    max_mu = 1e-6
 
     for step in range(steps):
         # Save previous state for backtracking
@@ -294,8 +309,8 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
                 # Recompute from restored params
                 lam_pos_bt, lam_neg_bt = model(feats)
                 lam_bt = lam_pos_bt - lam_neg_bt
-                slack_bt = c - (A.t() @ lam_bt)
-                slack_bt = torch.clamp(slack_bt, min=interior_margin)
+                slack_bt = c - (A.t() @ lam_bt) +interior_margin
+                # slack_bt = torch.clamp(slack_bt, min=interior_margin)
 
                 barrier_bt = -torch.log(slack_bt).mean()
                 dual_obj_bt = b @ lam_bt
@@ -319,15 +334,23 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
 
             if not success:
                 print(f"[Step {step}] Could not restore feasibility; stopping.")
+                smallest5 = torch.topk(slack_bt, 5, largest=False).values
+                print(
+                    f"step {step} | dual {sign * dual_obj_bt.item():.4f} | "
+                    f"min slack {slack_bt.min().item():.6f} | "
+                    f"max slack {slack_bt.max().item():.6f} | "
+                    f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+                    # f"mu {mu:.3e}"
+                )
                 model.load_state_dict(prev_state)
                 for g, old_lr in zip(optimizer.param_groups, lr_prev):
                     g["lr"] = old_lr
                 break
 
         # Central path parameter update
-        mu = 1.0 / (step + 1)
+        mu = 10.0 / (step + 1)
         mu = max(mu, max_mu)
-        if step % 1000 == 0:
+        if step % 100 == 0 and step > 10000:
             max_mu = max_mu * 0.99
 
         if step % 1000 == 0:
@@ -367,6 +390,453 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
     lam_neg_np = lam_neg.detach().cpu().numpy()
 
     return lam_pos_np, lam_neg_np, nu
+
+
+def solve_dual_nn2(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, lr=1e-5, name="Run1", hidden=5, layers=2):
+    if wandb.run is not None:
+        wandb.finish()
+
+    if upper == False:
+        name = name + "_LowerBound"
+    else:
+        name = name + "_UpperBound"
+
+    wandb.init(
+        project="NeuralDualSolver",
+        name=name,
+        config={"steps": steps, "lr": lr, "k": k},
+        reinit=True,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    sign = 1 if upper else -1
+    c = sign * c
+
+    if "IV_cont" in name:
+        grid = [[z/(k-1), 2*t-1, y/(k-1)] for z, t, y in labels[:-1]]
+        grid.append(labels[-1])  # normalization constraint in primal
+        feats = torch.tensor(grid, dtype=torch.float32, device=device)
+    elif "Edu_vs_Voting" in name:
+        # If you need this branch, define kx, ky appropriately
+        obs_tuples = [(x, d, y) for x, d, y in labels]
+        kx = max(x for x, _, _ in obs_tuples) + 1
+        ky = max(y for _, _, y in obs_tuples) + 1
+        obs_tuples = [(x, d, y) for x in range(kx) for d in [0, 1] for y in range(ky)]
+        grid = [
+            [x / (kx - 1), 2 * d - 1, y_centers[y]]
+            for (x, d, y) in obs_tuples
+        ]
+        grid.append([-1, -1, -1])  # normalization constraint in primal
+        feats = torch.tensor(grid, dtype=torch.float32, device=device)
+    else:
+        feats = None  # unused
+
+    A = torch.tensor(A, dtype=torch.float32, device=device)
+    A_obs = A #[:-1]
+    b = torch.tensor(b, dtype=torch.float32, device=device)
+    b_obs = b # [:-1]
+    c = torch.tensor(c, dtype=torch.float32, device=device)
+
+    model = DualModel2(h=hidden, num_layers=layers).to(device)
+
+    print("\nNeural network parameters:", count_params(model))
+    print("Dual variables:", len(b))
+    print("Compression ratio: {:.2f}x".format(len(b)/count_params(model)))
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
+
+    model.nu_raw.data.fill_(0.0)
+
+    mu = 1
+
+    for step in range(steps):
+        optimizer.zero_grad()
+
+        lam_pos, lam_neg, nu_raw = model(feats)
+        lam = lam_pos - lam_neg
+
+        # nu_max = torch.min(c - (A_obs.t() @ lam))
+        # nu = nu_max - torch.nn.functional.softplus(nu_raw)
+        # nu = torch.tanh(nu_raw) * nu_max
+        # nu = nu_max - softplus(nu_raw)
+
+        slack = c - (A_obs.t() @ lam)
+        # if slack.min().item() < EPS_TOL**2:
+        #     print(slack.min().item())
+        #     break
+
+        violation = torch.relu(1e-6 -(c - (A_obs.t() @ lam )))#+ nu)))
+        penalty = 1 * violation.max()
+
+        dual_obj = (b_obs+EPS_TOL)@lam_pos - (b_obs-EPS_TOL)@lam_neg  # + nu
+        # nu_reg = torch.abs(nu).mean()
+        # loss = -(dual_obj +nu) + mu * (penalty + nu_reg) 
+        loss = -(dual_obj) + mu * (penalty)
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
+        scheduler.step()
+        optimizer.step()
+
+        violation_mask = slack > 0
+
+        # if violation_mask.any():
+        #     print("violation")
+
+        mu = min(mu * 1.002, 100)
+
+        if step % 1000 == 0:
+            with torch.no_grad():
+                wandb.log({
+                    "step": step,
+                    "dual_obj": (sign * dual_obj).item(),
+                    "min_slack": slack.min().item(),
+                    "max_slack": slack.max().item(),
+                    "mean_slack": slack.mean().item(),
+                    "num_active": (slack < 1e-4).sum().item(),
+                    "loss": loss.item(),
+                })
+
+            smallest5 = torch.topk(slack, 5, largest=False).values
+
+            print(
+                f"step {step} | dual {sign*dual_obj.item():.4f} | "
+                f"min slack {slack.min().item():.6f} | "
+                f"max slack {slack.max().item():.6f} | "
+                f"top5 smallest {smallest5.detach().cpu().numpy()} |"
+                # f"nu loss {nu_reg.item():.6f}"
+            )
+
+        min_slack = slack.min()
+        # mean_abs_nu = torch.abs(nu).mean().item()
+        if (min_slack > 1e-8) and (min_slack < SLACK_TOL):#  and (mean_abs_nu < NU_TOL):
+            smallest5 = torch.topk(slack, 5, largest=False).values
+            print(
+                f"step {step} | dual {sign * dual_obj.item():.4f} | "
+                f"min slack {slack.min().item():.6f} | "
+                f"max slack {slack.max().item():.6f} | "
+                f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+                f"mu {mu:.3e}"
+            )
+            if upper:
+                model_path = "upper_" + "stage1_weights.pt"
+            else:
+                model_path = "lower_" + "stage1_weights.pt"
+            torch.save(model.state_dict(), model_path)
+            print("Feasible, near-boundary, and nu ≈ 0 → stop Stage 1")
+            break
+
+        if step == steps - 1:
+            smallest5 = torch.topk(slack, 5, largest=False).values
+            print(
+                f"step {step} | dual {sign * dual_obj.item():.4f} | "
+                f"min slack {slack.min().item():.6f} | "
+                f"max slack {slack.max().item():.6f} | "
+                f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+                f"mu {mu:.3e}"
+            )
+            if upper:
+                model_path = "upper_" + "stage1_weights.pt"
+            else:
+                model_path = "lower_" + "stage1_weights.pt"
+            torch.save(model.state_dict(), model_path)
+            print("Reaching max epochs for stage 1")
+
+    dual_value = dual_obj.item()
+
+    if upper:
+        dual_value = -dual_value
+
+    return lam_pos.detach().cpu().numpy(), lam_neg.detach().cpu().numpy(), dual_value# nu.item()
+
+
+
+def solve_dual_nn_combined(
+    A, b, c, labels, k, y_centers=None, upper=False,
+    steps_stage1=3000, steps_stage2=3000,
+    lr1=1e-5, lr2=1e-5,
+    name="Run1", hidden=5, layers=2,
+    interior_margin=1e-3, max_backtrack=50,
+    warm_start_steps=2000
+):
+    """
+    Stage 1: use solve_dual_nn2 to find interior feasible lam
+    Stage 2: central-path optimization with strict feasibility
+    """
+    if upper:
+      print("optimizing upperbound")
+      sign = 1
+    else:
+      print("optimizing lowerbound")
+      sign = -1
+    # sign = 1 if upper else -1
+    # sign = -1 if upper else 1
+
+    # --------------------------
+    # Stage 1: Feasible warm-start
+    # --------------------------
+    print("\n=== Stage 1: Feasible warm-start using solve_dual_nn2 ===")
+    lam_pos0, lam_neg0, nu0 = solve_dual_nn2(
+        A, b, c, labels, k, y_centers=y_centers,
+        upper=upper, steps=steps_stage1, lr=lr1,
+        name=name+"_Stage1", hidden=hidden, layers=layers
+    )
+
+    # lam_star = torch.tensor(lam_pos0 - lam_neg0, dtype=torch.float32)
+
+    # --------------------------
+    # Stage 2: Central path
+    # --------------------------
+    print("\n=== Stage 2: Central-path optimization ===")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    A = torch.tensor(A, dtype=torch.float32, device=device)
+    b = torch.tensor(b, dtype=torch.float32, device=device)
+    c = torch.tensor(c, dtype=torch.float32, device=device)
+    c = sign * c
+
+    # Build feature grid (same as before)
+    if "IV_cont" in name:
+        grid = [[z/(k-1), 2*t-1, y/(k-1)] for z, t, y in labels[:-1]]
+        grid.append(labels[-1])
+        feats = torch.tensor(grid, dtype=torch.float32, device=device)
+    else:
+        raise ValueError("Need feature grid")
+
+    # Build NN
+    model = DualModel2(h=hidden, num_layers=layers).to(device)
+    #     # Build NN for Stage 2
+    # model = DualModel(h=hidden, num_layers=layers).to(device)
+
+    # LOAD WEIGHTS FROM STAGE 1
+    if upper:
+        model_path = "upper_" + "stage1_weights.pt"
+    else:
+        model_path = "lower_" + "stage1_weights.pt"
+    
+    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    print("Loaded Stage‑1 weights into Stage‑2 model.")
+
+    # Warm-start NN to match lam_star
+    # optimizer_warm = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # lam_star = lam_star.to(device)
+
+    # for _ in range(warm_start_steps):
+    #     lam_pos_ws, lam_neg_ws = model(feats)
+    #     lam_ws = lam_pos_ws - lam_neg_ws
+    #     loss_ws = torch.mean((lam_ws - lam_star)**2)
+    #     optimizer_warm.zero_grad()
+    #     loss_ws.backward()
+    #     optimizer_warm.step()
+
+    # ---------- Phase 2: central path on NN parameters ----------
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps_stage2)
+
+    mu = 1.0
+    mu_floor = 1e-6
+    FEAS_TOL = 1e-8  # numerical tolerance for feasibility
+
+    for step in range(steps_stage2):
+        # Save previous state for backtracking
+        prev_state = {k: v.clone() for k, v in model.state_dict().items()}
+        lr_prev = [g["lr"] for g in optimizer.param_groups]
+
+        # ----- forward -----
+        lam_pos, lam_neg, _ = model(feats)
+        lam = lam_pos - lam_neg
+
+        slack = c - (A.t() @ lam)
+        # use clamped slack for barrier to stay strictly inside numerically
+        slack_barrier = torch.clamp(slack, min=interior_margin)
+
+        barrier = -torch.log(slack_barrier).mean()
+        dual_obj = b @ lam
+        loss = -dual_obj + mu * barrier
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
+        optimizer.step()
+        scheduler.step()
+
+        # ----- feasibility check -----
+        lam_pos, lam_neg, _ = model(feats)
+        lam = lam_pos - lam_neg
+        slack = c - (A.t() @ lam)
+
+        if (slack < FEAS_TOL).any():
+            # only backtrack if we are truly outside, not just at -1e-12 noise
+            success = False
+            for _ in range(max_backtrack):
+                # restore params
+                model.load_state_dict(prev_state)
+
+                # halve learning rate
+                for g in optimizer.param_groups:
+                    g["lr"] *= 0.5
+
+                # recompute from restored params
+                lam_pos_bt, lam_neg_bt, _ = model(feats)
+                lam_bt = lam_pos_bt - lam_neg_bt
+                slack_bt = c - (A.t() @ lam_bt)
+                slack_barrier_bt = torch.clamp(slack_bt, min=interior_margin)
+
+                barrier_bt = -torch.log(slack_barrier_bt).mean()
+                dual_obj_bt = b @ lam_bt
+                loss_bt = -dual_obj_bt + mu * barrier_bt
+
+                optimizer.zero_grad()
+                loss_bt.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                lam_pos_bt, lam_neg_bt, _ = model(feats)
+                lam_bt = lam_pos_bt - lam_neg_bt
+                slack_bt = c - (A.t() @ lam_bt)
+
+                if (slack_bt >= FEAS_TOL).all():
+                    success = True
+                    slack = slack_bt
+                    dual_obj = dual_obj_bt
+                    loss = loss_bt
+                    lam_pos = lam_pos_bt
+                    lam_neg = lam_neg_bt
+                    lam = lam_pos-lam_neg
+                    break
+
+            if not success:
+                print(f"[Step {step}] Could not restore feasibility; stopping.")
+                smallest5 = torch.topk(slack_bt, 5, largest=False).values
+                print(
+                    f"step {step} | dual {sign * dual_obj_bt.item():.4f} | "
+                    f"min slack {slack_bt.min().item():.6f} | "
+                    f"max slack {slack_bt.max().item():.6f} | "
+                    f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+                    # f"mu {mu:.3e}"
+                )
+                model.load_state_dict(prev_state)
+                for g, old_lr in zip(optimizer.param_groups, lr_prev):
+                    g["lr"] = old_lr
+                break
+
+        # ----- update barrier parameter -----
+        mu = max(1.0 / (step + 1), mu_floor)
+
+        if step % 1000 == 0:
+            with torch.no_grad():
+                wandb.log({
+                    "step": step,
+                    "dual_obj": (sign * dual_obj).item(),
+                    "min_slack": slack.min().item(),
+                    "max_slack": slack.max().item(),
+                    "mean_slack": slack.mean().item(),
+                    "num_active": (slack < 1e-6).sum().item(),
+                    "loss": loss.item(),
+                    "mu": mu,
+                })
+
+                smallest5 = torch.topk(slack, 5, largest=False).values
+                print(
+                    f"step {step} | dual {sign * dual_obj.item():.4f} | "
+                    f"min slack {slack.min().item():.6f} | "
+                    f"max slack {slack.max().item():.6f} | "
+                    f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+                    f"mu {mu:.3e}"
+                )
+
+    # Final output
+    lam_pos_np = lam_pos.detach().cpu().numpy()
+    lam_neg_np = lam_neg.detach().cpu().numpy()
+    nu = (c - (A.t() @ lam)).min().item()
+
+    return lam_pos_np, lam_neg_np, nu
+    # Central-path optimizer
+
+    # optimizer = torch.optim.Adam(model.parameters(), lr=lr2)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps_stage2)
+
+    # mu = 1.0
+    # mu_floor = 1e-6
+
+    # for step in range(steps_stage2):
+
+    #     # Save state for backtracking
+    #     prev_state = {k: v.clone() for k, v in model.state_dict().items()}
+    #     lr_prev = [g["lr"] for g in optimizer.param_groups]
+
+    #     # Forward
+    #     lam_pos, lam_neg = model(feats)
+    #     lam = lam_pos - lam_neg
+
+    #     slack = c - (A.t() @ lam)
+    #     if (slack <= 0).any():
+    #         slack = torch.clamp(slack, min=interior_margin)
+
+    #     barrier = -torch.log(slack).mean()
+    #     dual_obj = b @ lam
+    #     loss = -dual_obj + mu * barrier
+
+    #     optimizer.zero_grad()
+    #     loss.backward()
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    #     optimizer.step()
+    #     scheduler.step()
+
+    #     # Check feasibility
+    #     lam_pos, lam_neg = model(feats)
+    #     lam = lam_pos - lam_neg
+    #     slack = c - (A.t() @ lam)
+
+    #     if (slack <= 0).any():
+    #         success = False
+    #         for _ in range(max_backtrack):
+    #             model.load_state_dict(prev_state)
+    #             for g in optimizer.param_groups:
+    #                 g["lr"] *= 0.5
+
+    #             lam_pos_bt, lam_neg_bt = model(feats)
+    #             lam_bt = lam_pos_bt - lam_neg_bt
+    #             slack_bt = c - (A.t() @ lam_bt)
+    #             slack_bt = torch.clamp(slack_bt, min=interior_margin)
+
+    #             barrier_bt = -torch.log(slack_bt).mean()
+    #             dual_obj_bt = b @ lam_bt
+    #             loss_bt = -dual_obj_bt + mu * barrier_bt
+
+    #             optimizer.zero_grad()
+    #             loss_bt.backward()
+    #             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    #             optimizer.step()
+
+    #             lam_pos_bt, lam_neg_bt = model(feats)
+    #             lam_bt = lam_pos_bt - lam_neg_bt
+    #             slack_bt = c - (A.t() @ lam_bt)
+
+    #             if (slack_bt > 0).all():
+    #                 success = True
+    #                 break
+
+    #         if not success:
+    #             print("Could not restore feasibility — stopping.")
+    #             break
+
+    #     # Update barrier parameter
+    #     mu = max(1.0/(step+1), mu_floor)
+
+    #     if step % 500 == 0:
+    #         print(f"step {step} | dual {dual_obj.item():.4f} | min slack {slack.min().item():.6e} | mu {mu:.3e}")
+
+    # # Final output
+    # lam_pos_np = lam_pos.detach().cpu().numpy()
+    # lam_neg_np = lam_neg.detach().cpu().numpy()
+    # nu = (c - (A.t() @ lam)).min().item()
+
+    # return lam_pos_np, lam_neg_np, nu
 
 
 
@@ -442,7 +912,7 @@ def solve_dual_cp_gd(A, b, c, labels, k, y_centers=None, upper=False,
 
     # ---------- Phase 2: central path on lam ----------
     lam = lam.detach().clone().requires_grad_(True)
-    optimizer = torch.optim.Adam([lam], lr=lr)
+    optimizer = torch.optim.Adam([lam], lr=lr2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
 
     mu = 1.0
@@ -493,7 +963,7 @@ def solve_dual_cp_gd(A, b, c, labels, k, y_centers=None, upper=False,
 
                 optimizer.zero_grad()
                 loss_bt.backward()
-                torch.nn.utils.clip_grad_norm_([lam], 1.0)
+                torch.nn.utils.clip_grad_norm_([lam], 0.25)
                 optimizer.step()
 
                 slack_bt = c - (A.t() @ lam)
@@ -610,31 +1080,46 @@ if __name__ == "__main__":
     print("\nTraining neural dual...")
     start = time.time()
 
-    lamL_pos, lamL_neg, nuL = solve_dual_nn(
-        A, b, c, labels, k,
-        y_centers=y_centers,
-        upper=False,
-        lr=args.lr_lower,
-        steps=n,
-        name=wandb_name,
-        hidden=args.hidden,
-        layers=args.layers
-    )
+    # lamL_pos, lamL_neg, nuL = solve_dual_nn2(
+    #     A, b, c, labels, k,
+    #     y_centers=y_centers,
+    #     upper=False,
+    #     lr=args.lr_lower,
+    #     steps=n,
+    #     name=wandb_name,
+    #     hidden=args.hidden,
+    #     layers=args.layers
+    # )
+    lamL_pos, lamL_neg, nuL = solve_dual_nn_combined(
+        A, b, c, labels, k, y_centers=None, upper=False,
+        steps_stage1=n, steps_stage2=5000,
+        lr1=args.lr_upper, lr2=1e-10,
+        name=wandb_name, hidden=args.hidden, layers=args.layers,
+        interior_margin=1e-8, max_backtrack=100,
+        warm_start_steps=5000)
 
-    lamU_pos, lamU_neg, nuU = solve_dual_nn(
-        A, b, c, labels, k,
-        y_centers=y_centers,
-        upper=True,
-        lr=args.lr_upper,
-        steps=n,
-        name=wandb_name,
-        hidden=args.hidden,
-        layers=args.layers
-    )
+    lamU_pos, lamU_neg, nuU = solve_dual_nn_combined(
+        A, b, c, labels, k, y_centers=None, upper=True,
+        steps_stage1=n, steps_stage2=5000,
+        lr1=args.lr_lower, lr2=1e-10,
+        name=wandb_name, hidden=args.hidden, layers=args.layers,
+        interior_margin=1e-8, max_backtrack=100,
+        warm_start_steps=2000)
+
+    # lamU_pos, lamU_neg, nuU = solve_dual_nn2(
+    #     A, b, c, labels, k,
+    #     y_centers=y_centers,
+    #     upper=True,
+    #     lr=args.lr_upper,
+    #     steps=n,
+    #     name=wandb_name,
+    #     hidden=args.hidden,
+    #     layers=args.layers
+    # )
 
     b_obs = b #[:-1]
-    lower = -((b_obs+EPS_TOL)@lamL_pos - (b_obs-EPS_TOL)@lamL_neg + nuL)
-    upper = ((b_obs+EPS_TOL)@lamU_pos - (b_obs-EPS_TOL)@lamU_neg + nuU)
+    lower = -((b_obs+EPS_TOL)@lamL_pos - (b_obs-EPS_TOL)@lamL_neg) #+ nuL)
+    upper = (b_obs+EPS_TOL)@lamU_pos - (b_obs-EPS_TOL)@lamU_neg # + nuU)
 
     end = time.time()
 
