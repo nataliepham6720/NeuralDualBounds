@@ -22,7 +22,7 @@ from Data.Edu_vs_Voting.LP_construction import *
 EPS_TOL = 0 #1e-6
 K_active = 10
 
-SLACK_TOL = 1e-4
+SLACK_TOL = 1e-3
 NU_TOL = 1e-9
 
 
@@ -410,7 +410,7 @@ def solve_dual_nn2(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, 
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    sign = 1 if upper else -1
+    sign = -1 if upper else 1
     c = sign * c
 
     if "IV_cont" in name:
@@ -450,6 +450,9 @@ def solve_dual_nn2(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, 
     model.nu_raw.data.fill_(0.0)
 
     mu = 1
+    # nu = 1
+    nu = torch.zeros_like(c)   # size = number of constraints
+    rho = 1.0
 
     for step in range(steps):
         optimizer.zero_grad()
@@ -467,18 +470,26 @@ def solve_dual_nn2(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, 
         #     print(slack.min().item())
         #     break
 
-        violation = torch.relu(1e-6 -(c - (A_obs.t() @ lam )))#+ nu)))
+        violation = torch.relu(-(c - (A_obs.t() @ lam )))#+ nu)))
         penalty = 1 * violation.max()
 
         dual_obj = (b_obs+EPS_TOL)@lam_pos - (b_obs-EPS_TOL)@lam_neg  # + nu
+        nu = torch.clamp(nu + rho * violation.detach(), min=0)
         # nu_reg = torch.abs(nu).mean()
         # loss = -(dual_obj +nu) + mu * (penalty + nu_reg) 
-        loss = -(dual_obj) + mu * (penalty)
+        # violation = torch.relu(A.T @ lam - c)
+
+        loss = -dual_obj \
+              + (nu * violation).sum() \
+              + rho * (violation**2).mean()
+        nu = nu + rho * violation.detach()
+        # loss = -(dual_obj) + mu * (penalty)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
-        scheduler.step()
         optimizer.step()
+        scheduler.step()
+        
 
         violation_mask = slack > 0
 
@@ -488,6 +499,7 @@ def solve_dual_nn2(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, 
         mu = min(mu * 1.002, 100)
 
         if step % 1000 == 0:
+            rho = min(rho * 1.5, 1e5)
             with torch.no_grad():
                 wandb.log({
                     "step": step,
@@ -511,22 +523,23 @@ def solve_dual_nn2(A, b, c, labels, k, y_centers=None, upper=False, steps=3000, 
 
         min_slack = slack.min()
         # mean_abs_nu = torch.abs(nu).mean().item()
-        if (min_slack > 1e-8) and (min_slack < SLACK_TOL):#  and (mean_abs_nu < NU_TOL):
-            smallest5 = torch.topk(slack, 5, largest=False).values
-            print(
-                f"step {step} | dual {sign * dual_obj.item():.4f} | "
-                f"min slack {slack.min().item():.6f} | "
-                f"max slack {slack.max().item():.6f} | "
-                f"top5 smallest {smallest5.detach().cpu().numpy()} | "
-                f"mu {mu:.3e}"
-            )
-            if upper:
-                model_path = "upper_" + "stage1_weights.pt"
-            else:
-                model_path = "lower_" + "stage1_weights.pt"
-            torch.save(model.state_dict(), model_path)
-            print("Feasible, near-boundary, and nu ≈ 0 → stop Stage 1")
-            break
+        # if (min_slack > 1e-8) and (min_slack < SLACK_TOL) and step > 5000:#  and (mean_abs_nu < NU_TOL):
+        # if (min_slack > 1e-8) and step > 5000:
+        #     smallest5 = torch.topk(slack, 5, largest=False).values
+        #     print(
+        #         f"step {step} | dual {sign * dual_obj.item():.4f} | "
+        #         f"min slack {slack.min().item():.6f} | "
+        #         f"max slack {slack.max().item():.6f} | "
+        #         f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+        #         f"mu {mu:.3e}"
+        #     )
+        #     if upper:
+        #         model_path = "upper_" + "stage1_weights.pt"
+        #     else:
+        #         model_path = "lower_" + "stage1_weights.pt"
+        #     torch.save(model.state_dict(), model_path)
+        #     print("Feasible, near-boundary, and nu ≈ 0 → stop Stage 1")
+        #     break
 
         if step == steps - 1:
             smallest5 = torch.topk(slack, 5, largest=False).values
@@ -558,7 +571,7 @@ def solve_dual_nn_combined(
     steps_stage1=3000, steps_stage2=3000,
     lr1=1e-5, lr2=1e-5,
     name="Run1", hidden=5, layers=2,
-    interior_margin=1e-3, max_backtrack=50,
+    interior_margin=1e-3, max_backtrack=10,
     warm_start_steps=2000
 ):
     """
@@ -567,10 +580,10 @@ def solve_dual_nn_combined(
     """
     if upper:
       print("optimizing upperbound")
-      sign = 1
+      sign = -1
     else:
       print("optimizing lowerbound")
-      sign = -1
+      sign = 1
     # sign = 1 if upper else -1
     # sign = -1 if upper else 1
 
@@ -595,8 +608,9 @@ def solve_dual_nn_combined(
 
     A = torch.tensor(A, dtype=torch.float32, device=device)
     b = torch.tensor(b, dtype=torch.float32, device=device)
-    c = torch.tensor(c, dtype=torch.float32, device=device)
     c = sign * c
+    c = torch.tensor(c, dtype=torch.float32, device=device)
+    
 
     # Build feature grid (same as before)
     if "IV_cont" in name:
@@ -641,113 +655,148 @@ def solve_dual_nn_combined(
     mu_floor = 1e-6
     FEAS_TOL = 1e-8  # numerical tolerance for feasibility
 
-    for step in range(steps_stage2):
-        # Save previous state for backtracking
-        prev_state = {k: v.clone() for k, v in model.state_dict().items()}
-        lr_prev = [g["lr"] for g in optimizer.param_groups]
+    lam_pos, lam_neg, _ = model(feats)
+    lam = lam_pos - lam_neg
 
-        # ----- forward -----
-        lam_pos, lam_neg, _ = model(feats)
-        lam = lam_pos - lam_neg
+    slack = c - (A.t() @ lam)
+    dual_obj = b @ lam
 
-        slack = c - (A.t() @ lam)
-        # use clamped slack for barrier to stay strictly inside numerically
-        slack_barrier = torch.clamp(slack, min=interior_margin)
+    smallest5 = torch.topk(slack, 5, largest=False).values
+    print(
+        f"Saved: dual {sign * dual_obj.item():.4f} | "
+        f"min slack {slack.min().item():.6f} | "
+        f"max slack {slack.max().item():.6f} | "
+        f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+        f"mu {mu:.3e}"
+    )
 
-        barrier = -torch.log(slack_barrier).mean()
-        dual_obj = b @ lam
-        loss = -dual_obj + mu * barrier
+    # for step in range(steps_stage2):
+    #     # Save previous state for backtracking
+    #     prev_state = {k: v.clone() for k, v in model.state_dict().items()}
+    #     lr_prev = [g["lr"] for g in optimizer.param_groups]
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
-        optimizer.step()
-        scheduler.step()
+    #     # ----- forward -----
+    #     lam_pos, lam_neg, _ = model(feats)
+    #     lam = lam_pos - lam_neg
 
-        # ----- feasibility check -----
-        lam_pos, lam_neg, _ = model(feats)
-        lam = lam_pos - lam_neg
-        slack = c - (A.t() @ lam)
+    #     slack = c - (A.t() @ lam)
+    #     dual_obj = b @ lam
 
-        if (slack < FEAS_TOL).any():
-            # only backtrack if we are truly outside, not just at -1e-12 noise
-            success = False
-            for _ in range(max_backtrack):
-                # restore params
-                model.load_state_dict(prev_state)
+    #     smallest5 = torch.topk(slack, 5, largest=False).values
+    #     print(
+    #         f"step {step} | dual {sign * dual_obj.item():.4f} | "
+    #         f"min slack {slack.min().item():.6f} | "
+    #         f"max slack {slack.max().item():.6f} | "
+    #         f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+    #         f"mu {mu:.3e}"
+    #     )
+        
+    #     # ----- feasibility check -----
+    #     # lam_pos, lam_neg, _ = model(feats)
+    #     # lam = lam_pos - lam_neg
+    #     # slack = c - (A.t() @ lam)
 
-                # halve learning rate
-                for g in optimizer.param_groups:
-                    g["lr"] *= 0.5
+    #     if (slack < FEAS_TOL).any():
+    #         # only backtrack if we are truly outside, not just at -1e-12 noise
+    #         success = False
+    #         for _ in range(max_backtrack):
+    #             # restore params
+    #             model.load_state_dict(prev_state)
 
-                # recompute from restored params
-                lam_pos_bt, lam_neg_bt, _ = model(feats)
-                lam_bt = lam_pos_bt - lam_neg_bt
-                slack_bt = c - (A.t() @ lam_bt)
-                slack_barrier_bt = torch.clamp(slack_bt, min=interior_margin)
+    #             # halve learning rate
+    #             for g in optimizer.param_groups:
+    #                 g["lr"] *= 0.5
+    #                 print(g["lr"])
 
-                barrier_bt = -torch.log(slack_barrier_bt).mean()
-                dual_obj_bt = b @ lam_bt
-                loss_bt = -dual_obj_bt + mu * barrier_bt
+    #             # recompute from restored params
+    #             lam_pos_bt, lam_neg_bt, _ = model(feats)
+    #             lam_bt = lam_pos_bt - lam_neg_bt
+    #             slack_bt = c - (A.t() @ lam_bt)
+    #             slack_barrier_bt = slack_bt #torch.clamp(slack_bt, min=interior_margin)
 
-                optimizer.zero_grad()
-                loss_bt.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+    #             barrier_bt = -torch.log(slack_barrier_bt).mean()
+    #             dual_obj_bt = b @ lam_bt
+    #             loss_bt = -dual_obj_bt + mu * barrier_bt
 
-                lam_pos_bt, lam_neg_bt, _ = model(feats)
-                lam_bt = lam_pos_bt - lam_neg_bt
-                slack_bt = c - (A.t() @ lam_bt)
+    #             optimizer.zero_grad()
+    #             loss_bt.backward()
+    #             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
+    #             optimizer.step()
 
-                if (slack_bt >= FEAS_TOL).all():
-                    success = True
-                    slack = slack_bt
-                    dual_obj = dual_obj_bt
-                    loss = loss_bt
-                    lam_pos = lam_pos_bt
-                    lam_neg = lam_neg_bt
-                    lam = lam_pos-lam_neg
-                    break
+    #             lam_pos_bt, lam_neg_bt, _ = model(feats)
+    #             lam_bt = lam_pos_bt - lam_neg_bt
+    #             slack_bt = c - (A.t() @ lam_bt)
+    #             dual_obj_bt = b @ lam_bt
 
-            if not success:
-                print(f"[Step {step}] Could not restore feasibility; stopping.")
-                smallest5 = torch.topk(slack_bt, 5, largest=False).values
-                print(
-                    f"step {step} | dual {sign * dual_obj_bt.item():.4f} | "
-                    f"min slack {slack_bt.min().item():.6f} | "
-                    f"max slack {slack_bt.max().item():.6f} | "
-                    f"top5 smallest {smallest5.detach().cpu().numpy()} | "
-                    # f"mu {mu:.3e}"
-                )
-                model.load_state_dict(prev_state)
-                for g, old_lr in zip(optimizer.param_groups, lr_prev):
-                    g["lr"] = old_lr
-                break
+    #             print(f"debug: step {step} | dual {sign * dual_obj_bt.item():.4f} | "
+    #                 f"min slack {slack_bt.min().item():.6f} | "
+    #                 f"max slack {slack_bt.max().item():.6f} | ")
+    #                 # f"top5 smallest {smallest5.detach().cpu().numpy()} | ")
 
-        # ----- update barrier parameter -----
-        mu = max(1.0 / (step + 1), mu_floor)
+    #             if (slack_bt >= FEAS_TOL).all():
+    #                 print("success")
+    #                 success = True
+    #                 slack = slack_bt
+    #                 dual_obj = dual_obj_bt
+    #                 loss = loss_bt
+    #                 lam_pos = lam_pos_bt
+    #                 lam_neg = lam_neg_bt
+    #                 lam = lam_pos-lam_neg
+    #                 break
 
-        if step % 1000 == 0:
-            with torch.no_grad():
-                wandb.log({
-                    "step": step,
-                    "dual_obj": (sign * dual_obj).item(),
-                    "min_slack": slack.min().item(),
-                    "max_slack": slack.max().item(),
-                    "mean_slack": slack.mean().item(),
-                    "num_active": (slack < 1e-6).sum().item(),
-                    "loss": loss.item(),
-                    "mu": mu,
-                })
+    #         if not success:
+    #             print(f"[Step {step}] Could not restore feasibility; stopping.")
+    #             smallest5 = torch.topk(slack_bt, 5, largest=False).values
+    #             print(
+    #                 f"step {step} | dual {sign * dual_obj_bt.item():.4f} | "
+    #                 f"min slack {slack_bt.min().item():.6f} | "
+    #                 f"max slack {slack_bt.max().item():.6f} | "
+    #                 f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+    #                 # f"mu {mu:.3e}"
+    #             )
+    #             model.load_state_dict(prev_state)
+    #             for g, old_lr in zip(optimizer.param_groups, lr_prev):
+    #                 g["lr"] = old_lr
+    #             break
 
-                smallest5 = torch.topk(slack, 5, largest=False).values
-                print(
-                    f"step {step} | dual {sign * dual_obj.item():.4f} | "
-                    f"min slack {slack.min().item():.6f} | "
-                    f"max slack {slack.max().item():.6f} | "
-                    f"top5 smallest {smallest5.detach().cpu().numpy()} | "
-                    f"mu {mu:.3e}"
-                )
+    #     # use clamped slack for barrier to stay strictly inside numerically
+    #     slack_barrier = slack #torch.clamp(slack, min=interior_margin)
+
+    #     barrier = -torch.log(slack_barrier).mean()
+    #     dual_obj = b @ lam
+    #     loss = -dual_obj + mu * barrier
+
+    #     optimizer.zero_grad()
+    #     loss.backward()
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
+    #     optimizer.step()
+    #     scheduler.step()
+        
+
+    #     # ----- update barrier parameter -----
+    #     mu = max(1.0 / (step + 1), mu_floor)
+
+    #     if step % 1000 == 0:
+    #         with torch.no_grad():
+    #             wandb.log({
+    #                 "step": step,
+    #                 "dual_obj": (sign * dual_obj).item(),
+    #                 "min_slack": slack.min().item(),
+    #                 "max_slack": slack.max().item(),
+    #                 "mean_slack": slack.mean().item(),
+    #                 "num_active": (slack < 1e-6).sum().item(),
+    #                 "loss": loss.item(),
+    #                 "mu": mu,
+    #             })
+
+    #             smallest5 = torch.topk(slack, 5, largest=False).values
+    #             print(
+    #                 f"step {step} | dual {sign * dual_obj.item():.4f} | "
+    #                 f"min slack {slack.min().item():.6f} | "
+    #                 f"max slack {slack.max().item():.6f} | "
+    #                 f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+    #                 f"mu {mu:.3e}"
+    #             )
 
     # Final output
     lam_pos_np = lam_pos.detach().cpu().numpy()
@@ -1093,17 +1142,17 @@ if __name__ == "__main__":
     lamL_pos, lamL_neg, nuL = solve_dual_nn_combined(
         A, b, c, labels, k, y_centers=None, upper=False,
         steps_stage1=n, steps_stage2=5000,
-        lr1=args.lr_upper, lr2=1e-10,
+        lr1=args.lr_upper, lr2=1e-6,
         name=wandb_name, hidden=args.hidden, layers=args.layers,
-        interior_margin=1e-8, max_backtrack=100,
+        interior_margin=1e-8, max_backtrack=20,
         warm_start_steps=5000)
 
     lamU_pos, lamU_neg, nuU = solve_dual_nn_combined(
         A, b, c, labels, k, y_centers=None, upper=True,
         steps_stage1=n, steps_stage2=5000,
-        lr1=args.lr_lower, lr2=1e-10,
+        lr1=args.lr_lower, lr2=1e-5,
         name=wandb_name, hidden=args.hidden, layers=args.layers,
-        interior_margin=1e-8, max_backtrack=100,
+        interior_margin=1e-8, max_backtrack=20,
         warm_start_steps=2000)
 
     # lamU_pos, lamU_neg, nuU = solve_dual_nn2(
@@ -1118,8 +1167,8 @@ if __name__ == "__main__":
     # )
 
     b_obs = b #[:-1]
-    lower = -((b_obs+EPS_TOL)@lamL_pos - (b_obs-EPS_TOL)@lamL_neg) #+ nuL)
-    upper = (b_obs+EPS_TOL)@lamU_pos - (b_obs-EPS_TOL)@lamU_neg # + nuU)
+    lower = ((b_obs+EPS_TOL)@lamL_pos - (b_obs-EPS_TOL)@lamL_neg) #+ nuL)
+    upper = -((b_obs+EPS_TOL)@lamU_pos - (b_obs-EPS_TOL)@lamU_neg) # + nuU)
 
     end = time.time()
 
@@ -1133,7 +1182,7 @@ if __name__ == "__main__":
         print(f"NN upper bound : {upper:.4f}")
         print("True ATE = 3")
 
-        plot_dual_heatmap(lamL_pos-lamL_neg, labels[:-1], k, "Lower Bound Dual")
-        plot_dual_heatmap(lamU_pos-lamU_neg, labels[:-1], k, "Upper Bound Dual")
+        plot_dual_heatmap(lamL_pos-lamL_neg, labels[:-1], k, f"Lower Bound Dual - {lower:.4f}")
+        plot_dual_heatmap(lamU_pos-lamU_neg, labels[:-1], k, f"Upper Bound Dual - {upper:.4f}")
     
     print("Time taken: ", end-start)
