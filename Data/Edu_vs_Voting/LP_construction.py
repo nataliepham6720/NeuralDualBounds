@@ -94,16 +94,8 @@ def build_constraints_EV(P, kx, ky, y_bins):
     A = []
     b = []
 
-    # --------------------------------------------------------
-    # 1. Normalization
-    # --------------------------------------------------------
-    A.append(np.ones(n_vars))
-    b.append(1.0)
-
-    # --------------------------------------------------------
-    # 2. Observational constraints
+    # 1. Observational constraints
     # sum_{y0,y1: y = y_d} p(x,d,y0,y1) = P(x,d,y)
-    # --------------------------------------------------------
     for x in range(kx):
         for d in [0, 1]:
             for y in range(ky):
@@ -119,9 +111,11 @@ def build_constraints_EV(P, kx, ky, y_bins):
                 A.append(row)
                 b.append(P[x, d, y])
 
-    # --------------------------------------------------------
+    # 2. Normalization
+    A.append(np.ones(n_vars))
+    b.append(1.0)
+
     # 3. Objective: ATE using bin centers
-    # --------------------------------------------------------
     c = np.zeros(n_vars)
 
     # compute bin centers for Y

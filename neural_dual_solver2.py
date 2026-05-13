@@ -36,6 +36,7 @@ def get_args():
     parser.add_argument("--layers", type=int, default=2)
 
     parser.add_argument("--steps", type=int, default=150000)
+    parser.add_argument("--warm_start", type=int, default=2000)
     parser.add_argument("--lr_lower", type=float, default=5e-3)
     parser.add_argument("--lr_upper", type=float, default=5e-4)
 
@@ -44,18 +45,18 @@ def get_args():
     return parser.parse_args()
 
 
-SEED = 2022
+SEED = 2020
 print("Seed:", SEED)
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 class DualNet(nn.Module):
-    def __init__(self, h=10, num_layers=2):
+    def __init__(self,i=3, h=10, num_layers=2):
         super().__init__()
 
         layers = []
-        layers.append(nn.Linear(3, h))
+        layers.append(nn.Linear(i, h))
         layers.append(nn.LayerNorm(h))
         layers.append(nn.Tanh())
 
@@ -111,10 +112,10 @@ def init_weights(m):
 
 
 class DualModel(nn.Module):
-    def __init__(self, h=6, num_layers=2):
+    def __init__(self, i=3, h=6, num_layers=2):
         super().__init__()
 
-        self.shared_net = DualNet(h, num_layers)
+        self.shared_net = DualNet(i, h, num_layers)
         # self.log_scale = nn.Parameter(torch.tensor(-0.5))
         # self.nu_raw = nn.Parameter(torch.tensor(0.0))
 
@@ -150,7 +151,7 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
         name = name + "_UpperBound"
 
     wandb.init(
-        project="NeuralDualSolver",
+        project="NeuralDualSolver_Edu+Voting",
         name=name,
         config={"steps": steps, "lr": lr, "k": k},
         reinit=True,
@@ -167,16 +168,17 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
         grid.append(labels[-1])  # normalization constraint in primal
         feats = torch.tensor(grid, dtype=torch.float32, device=device)
     elif "Edu_vs_Voting" in name:
-        obs_tuples = [(x, d, y) for x, d, y in labels]
-        kx = max(x for x, _, _ in obs_tuples) + 1
-        ky = max(y for _, _, y in obs_tuples) + 1
-        obs_tuples = [(x, d, y) for x in range(kx) for d in [0, 1] for y in range(ky)]
-        grid = [
-            [x / (kx - 1), 2 * d - 1, y_centers[y]]
-            for (x, d, y) in obs_tuples
-        ]
-        grid.append([-1, -1, -1])  # normalization constraint in primal
+        kx = k
+        ky = k
+        # observational dual constraints only
+        obs_tuples = [(x, d, y) for x in range(kx)
+                                for d in [0, 1]
+                                for y in range(ky)]
+        grid = [[x / (kx - 1), 2 * d - 1, y_centers[y]] for (x, d, y) in obs_tuples]
+        # normalization constraint
+        grid.append([-1, -1, -1])
         feats = torch.tensor(grid, dtype=torch.float32, device=device)
+        print("feats shape:", feats.shape)
     else:
         raise ValueError("Need a feature grid for neural lam approximation")
 
@@ -185,31 +187,32 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
     c = torch.tensor(c, dtype=torch.float32, device=device)
 
     print("\nDual variables:", len(b))
+    input_size = feats.shape[1]
 
     # ---------- Build neural model for lam ----------
-    model = DualModel(h=hidden, num_layers=layers).to(device)
+    model = DualModel(i=input_size, h=hidden, num_layers=layers).to(device)
     print("Neural network parameters:", count_params(model))
     print("Compression ratio: {:.2f}x".format(len(b) / count_params(model)))
 
     model.train()
     optimizer_phase1 = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
-    for _ in range(10000):
+    for _ in range(warm_start_steps):
         lam  = model(feats)
         slack = c - (A.t() @ lam)
         violation = torch.relu(interior_margin - slack)
         mse = (interior_margin - slack) ** 2
-        loss = 100 * violation.max() + mse.mean()
+        loss = violation.max() #+ mse.mean()
         optimizer_phase1.zero_grad()
         loss.backward()
         optimizer_phase1.step()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
 
     # mu = 1.0
     
-    max_mu = 1e-6
+    max_mu = 1e-3
     t = 0
     mu = 1 / (t + 1)
 
@@ -294,7 +297,7 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
         scheduler.step()
 
         # t = 0 #step / 100000
-        interval = max(10000, int(300000 / (t + 1)))
+        interval = max(2500, int(100000 / (t + 1))) if mu > max_mu*10 else 2000
 
         if step % interval == 0:
             mu = 1 / (t + 1)
@@ -320,13 +323,14 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
                 })
 
                 smallest5 = torch.topk(slack, 5, largest=False).values
-                print(
-                    f"step {step} | dual {sign * dual_obj.item():.4f} | "
-                    f"min slack {slack.min().item():.6f} | "
-                    f"max slack {slack.max().item():.6f} | "
-                    f"top5 smallest {smallest5.detach().cpu().numpy()} | "
-                    f"mu {mu:.3e}"
-                )
+                if step % 2000 == 0:
+                    print(
+                        f"step {step} | dual {sign * dual_obj.item():.4f} | "
+                        f"min slack {slack.min().item():.6f} | "
+                        f"max slack {slack.max().item():.6f} | "
+                        f"top5 smallest {smallest5.detach().cpu().numpy()} | "
+                        f"mu {mu:.3e}"
+                    )
 
     # Final dual value
     dual_value = dual_obj.item()
@@ -354,6 +358,7 @@ if __name__ == "__main__":
     k = args.k
     name = args.name
     dist = args.distribution_gen
+    # warm_start = args.warm_start
 
     if name == "IV_cont":
         wandb_name = name + f"_k{k}_steps{n}_hidden{args.hidden}_layers{args.layers}"
@@ -364,9 +369,17 @@ if __name__ == "__main__":
 
             print("Estimating distribution...")
             P = empirical_distribution_IV(data, k)
+            print(P.shape)
         elif dist == "pre-load":
             print("Loading saved distribution...")
-            P = np.load("./Data/IV_cont/P8.npy")
+            if k == 6:
+               P = np.load("./Data/IV_cont/P6.npy")
+            elif k == 8:
+                P = np.load("./Data/IV_cont/P8.npy")
+            elif k == 10:
+                P = np.load("./Data/IV_cont/P10.npy")
+            else:
+                print("No prior data found!!!")
 
         print("Building LP system...")
         A, b, c, labels = build_constraints_IV(P, k)
@@ -377,15 +390,33 @@ if __name__ == "__main__":
 
         kx = ky = args.k
 
-        print("Generating data...")
-        data, Y0, Y1 = generate_data_EV(n_pts, tau=0.5, seed=SEED)
-        ATE_true = np.mean(Y1 - Y0)
-        print("True ATE:", ATE_true)
+        if dist == "generate":
+            print("Generating data...")
+            data, Y0, Y1 = generate_data_EV(n_pts, tau=0.5, seed=SEED)
+            ATE_true = np.mean(Y1 - Y0)
+            print("True ATE:", ATE_true)
+            print("Estimating distribution...")
+            P, x_bins, y_bins = empirical_distribution_EV(data, kx, ky)
+            print(P.shape)
+            y_centers = (y_bins[:-1] + y_bins[1:]) / 2 
+        elif dist == "pre-load":
+            print("Loading saved distribution...")
+            if k == 12:
+                data = np.load("./Data/Edu_vs_Voting/P12_EV.npz")
+                # P = np.load("./Data/Edu_vs_Voting/P12_EV.npy")
+            elif k == 16:
+                data = np.load("./Data/Edu_vs_Voting/P16_EV.npz")
+                # P = np.load("./Data/Edu_vs_Voting/P16_EV.npy")
+            else:
+                print("No prior data found!!!")
 
-        print("Estimating distribution...")
-        P, x_bins, y_bins = empirical_distribution_EV(data, kx, ky)
-        y_centers = (y_bins[:-1] + y_bins[1:]) / 2 
-
+            # Y, y_bins = discretize(P[:, 0], ky)
+            P = data["P"]
+            print(P.shape)
+            x_bins = data["x_bins"]
+            y_bins = data["y_bins"]
+            y_centers = (y_bins[:-1] + y_bins[1:]) / 2
+        
         print("Building LP system...")
         A, b, c, labels = build_constraints_EV(P, kx, ky, y_bins)
 
@@ -397,14 +428,14 @@ if __name__ == "__main__":
     print("\nTraining neural dual...")
     start = time.time()
 
-    lamL_pos = solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False, 
+    lamL_pos = solve_dual_nn(A, b, c, labels, k, y_centers=y_centers, upper=False, 
                   steps=n, lr=1e-5, name=wandb_name, hidden=args.hidden,
                   layers=args.layers, interior_margin=1e-3, max_backtrack=50,
-                  warm_start_steps=2000)
-    lamU_pos = solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=True, 
+                  warm_start_steps=args.warm_start)
+    lamU_pos = solve_dual_nn(A, b, c, labels, k, y_centers=y_centers, upper=True, 
                   steps=n, lr=1e-5, name=wandb_name, hidden=args.hidden,
                   layers=args.layers, interior_margin=1e-3, max_backtrack=50,
-                  warm_start_steps=2000)
+                  warm_start_steps=args.warm_start)
 
     b_obs = b #[:-1]
     lower = ((b_obs+EPS_TOL)@lamL_pos)
@@ -421,7 +452,7 @@ if __name__ == "__main__":
         print(f"NN upper bound : {upper:.4f}")
         print("True ATE = 3")
 
-        plot_dual_heatmap(lamL_pos, labels[:-1], k, "Lower Bound Dual")
-        plot_dual_heatmap(lamU_pos, labels[:-1], k, "Upper Bound Dual")
+        plot_dual_heatmap(lamL_pos, labels[:-1], k, "Lower Bound Dual - {lower:.4f}")
+        plot_dual_heatmap(lamU_pos, labels[:-1], k, "Upper Bound Dual - {upper:.4f}")
     
     print("Time taken: ", end-start)
