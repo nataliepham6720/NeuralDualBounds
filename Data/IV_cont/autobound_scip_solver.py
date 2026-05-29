@@ -12,6 +12,41 @@ SEED = 2020
 np.random.seed(SEED)
 # torch.manual_seed(SEED)
 
+# def solve_lp_scip(c, A, b, eps=1e-6):
+
+#     n = len(c)
+
+#     def solve_sense(sense):
+#         m = Model()
+#         m.hideOutput()
+
+#         p = [m.addVar(lb=0, ub=1) for _ in range(n)]
+
+#         # Sum to 1
+#         m.addCons(sum(p) == 1)
+
+#         # Conditional constraints
+#         for i in range(len(b)):
+#             expr = sum(A[i,j] * p[j] for j in range(n))
+#             m.addCons(expr >= b[i] - eps)
+#             m.addCons(expr <= b[i] + eps)
+
+#         obj = sum(c[j] * p[j] for j in range(n))
+#         m.setObjective(obj, sense)
+
+#         m.optimize()
+
+#         if m.getStatus() != "optimal":
+#             raise RuntimeError("SCIP infeasible — discretization too coarse")
+
+#         return m.getObjVal()
+#     print("Solve lower bound")
+#     lower = solve_sense("minimize")
+#     print("Solve upper bound")
+#     upper = solve_sense("maximize")
+
+#     return lower, upper
+
 def solve_lp_scip(c, A, b, eps=1e-6):
 
     n = len(c)
@@ -22,26 +57,37 @@ def solve_lp_scip(c, A, b, eps=1e-6):
 
         p = [m.addVar(lb=0, ub=1) for _ in range(n)]
 
-        # Sum to 1
+        # normalization
         m.addCons(sum(p) == 1)
 
-        # Conditional constraints
+        # constraints
         for i in range(len(b)):
-            expr = sum(A[i,j] * p[j] for j in range(n))
-            m.addCons(expr >= b[i] - eps)
-            m.addCons(expr <= b[i] + eps)
+            expr = sum(A[i,j]*p[j] for j in range(n))
+            m.addCons(expr >= b[i]-eps)
+            m.addCons(expr <= b[i]+eps)
 
-        obj = sum(c[j] * p[j] for j in range(n))
+        obj = sum(c[j]*p[j] for j in range(n))
         m.setObjective(obj, sense)
 
         m.optimize()
 
-        if m.getStatus() != "optimal":
-            raise RuntimeError("SCIP infeasible — discretization too coarse")
+        status = m.getStatus()
+        if status != "optimal":
+            raise RuntimeError(f"SCIP status: {status}")
+        print("obj", m.getObjVal(),         # optimal objective
+            "primal", m.getPrimalbound(), # primal bound
+            "dual", m.getDualbound(),     # dual bound
+            "gap",m.getGap())
+        return {
+            "obj": m.getObjVal(),         # optimal objective
+            "primal": m.getPrimalbound(), # primal bound
+            "dual": m.getDualbound(),     # dual bound
+            "gap": m.getGap()
+        }
 
-        return m.getObjVal()
     print("Solve lower bound")
     lower = solve_sense("minimize")
+
     print("Solve upper bound")
     upper = solve_sense("maximize")
 
@@ -53,21 +99,27 @@ def solve_lp_scip(c, A, b, eps=1e-6):
 # ============================================================
 n = 10000
 lam = 0.5 # np.random.rand()
-k=10
+k=8
 print(f"Discretize into {k} bins")
 
 data = generate_data_IV(n, lam)
 P = empirical_distribution_IV(data, k=k)
 
 A, b, c, labels = build_constraints_IV(P, k=k)
+A_pruned, c_pruned, keep_idx = prune_duplicate_columns(A, c)
+print(A)
+print("Original vars:", A.shape)
+print("Pruned vars:", A_pruned.shape)
 # c = ate_vector(k=8)
 start = time.time()
 lower, upper = solve_lp_scip(c, A, b)
+print('solving pruned problem')
+lower_pruned, upper_pruned = solve_lp_scip(c, A, b)
 end = time.time()
 
 print("\n==============================")
-print("ATE LOWER:", lower)
-print("ATE UPPER:", upper)
+# print("ATE LOWER:", lower, lower_pruned)
+# print("ATE UPPER:", upper, upper_pruned)
 print("TRUE ATE = 3")
 print("==============================")
 

@@ -151,7 +151,7 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
         name = name + "_UpperBound"
 
     wandb.init(
-        project="NeuralDualSolver_Edu+Voting",
+        project="NeuralDualSolver_IVcont",
         name=name,
         config={"steps": steps, "lr": lr, "k": k},
         reinit=True,
@@ -197,22 +197,24 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
     model.train()
     optimizer_phase1 = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
-    for _ in range(warm_start_steps):
+    for i in range(warm_start_steps):
         lam  = model(feats)
         slack = c - (A.t() @ lam)
         violation = torch.relu(interior_margin - slack)
         mse = (interior_margin - slack) ** 2
-        loss = violation.max() #+ mse.mean()
+        loss = violation.max() + 0.01 * mse.mean()
         optimizer_phase1.zero_grad()
         loss.backward()
         optimizer_phase1.step()
+        if i % 1000 == 0:
+            print(loss.item(), -b@lam, slack.min())
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
 
     # mu = 1.0
     
-    max_mu = 1e-3
+    max_mu = 1e-6
     t = 0
     mu = 1 / (t + 1)
 
@@ -281,35 +283,32 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
                     g["lr"] = old_lr
                 break
 
-        # Central path parameter update
-        # mu = 10.0 / (step + 1)
-        # mu = max(mu, max_mu)
-        # if step % 100 == 0 and step > 10000:
-        #     max_mu = max_mu * 0.99
+        optimizer.zero_grad()
+
+        lam = model(feats)
+        slack = c - (A.t() @ lam)
+
         barrier = -torch.log(slack).min()
         dual_obj = b @ lam
         loss = -dual_obj + mu * barrier
-
-        optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
 
-        # t = 0 #step / 100000
-        interval = max(2500, int(100000 / (t + 1))) if mu > max_mu*10 else 2000
+
+        interval = max(4000, int(400000 / (t + 1))) if mu > max_mu*100 else 2000
 
         if step % interval == 0:
             mu = 1 / (t + 1)
-            t = t+1
+            if t > 125:
+                t = t+5
+            else:
+                t = t+1
+                optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
             mu = max(mu, max_mu)
 
         if step % 1000 == 0:
-        #     if step % 100000 == 0:
-        #         t = step / 100000
-        #         mu = 1/(t+1)
-        #         mu = max(mu, max_mu)
-
             with torch.no_grad():
                 wandb.log({
                     "step": step,
@@ -317,7 +316,7 @@ def solve_dual_nn(A, b, c, labels, k, y_centers=None, upper=False,
                     "min_slack": slack.min().item(),
                     "max_slack": slack.max().item(),
                     "mean_slack": slack.mean().item(),
-                    "num_active": (slack < 1e-4).sum().item(),
+                    "num_active": (slack < 1e-3).sum().item(),
                     "loss": loss.item(),
                     "mu": mu,
                 })
@@ -452,7 +451,26 @@ if __name__ == "__main__":
         print(f"NN upper bound : {upper:.4f}")
         print("True ATE = 3")
 
-        plot_dual_heatmap(lamL_pos, labels[:-1], k, "Lower Bound Dual - {lower:.4f}")
-        plot_dual_heatmap(lamU_pos, labels[:-1], k, "Upper Bound Dual - {upper:.4f}")
+        plot_dual_heatmap(lamL_pos, labels[:-1], k, f"Lower Bound Dual - {lower:.4f}")
+        plot_dual_heatmap(lamU_pos, labels[:-1], k, f"Upper Bound Dual - {upper:.4f}")
     
     print("Time taken: ", end-start)
+
+
+    savepath = "Results"
+    os.makedirs(savepath, exist_ok=True)
+    saved_to = os.path.join(savepath, wandb_name + "_" + str(SEED) + ".txt")
+    print(saved_to)
+    with open(saved_to, "w") as f:
+        f.write("\n===== BOUNDS =====\n")
+
+        if name == "Edu_vs_Voting":
+            f.write(f"NN lower bound : {lower:.4f}\n")
+            f.write(f"NN upper bound : {upper:.4f}\n")
+
+        elif name == "IV_cont":
+            f.write(f"NN lower bound : {lower:.4f}\n")
+            f.write(f"NN upper bound : {upper:.4f}\n")
+            f.write("True ATE = 3\n")
+
+        f.write(f"Time taken: {end-start}\n")

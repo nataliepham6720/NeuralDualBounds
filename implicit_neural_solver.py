@@ -1,101 +1,24 @@
 """
-implicit_neural_solver.py
-=========================
-Matrix-free neural dual solver for causal partial-identification bounds.
+implicit_neural_solver2.py
+==========================
+Mirrors the algorithm in neural_dual_solver2.py exactly, but replaces the
+explicit (m x n) matrix A with the matrix-free ImplicitLP operators from
+implicit_neural_solver.py.
 
-Mathematical background
------------------------
-Both examples solve the same kind of LP: given an empirical distribution P
-over observed variables, bound a causal estimand (ATE) by finding the
-extremes of  c^T p  subject to  A p = b, p >= 0.
+Algorithm (unchanged from neural_dual_solver2):
+    Warm-start phase  — push all dual-constraint slacks above interior_margin
+                        using a max-violation loss (no barrier).
+    Central-path loop — log-barrier  loss = -b^T lam + mu * (-log slack).min()
+                        with AdamW + CosineAnnealingLR and backtracking.
+                        mu is annealed adaptively: drops every `interval` steps
+                        where interval shrinks as t grows.
 
-The DUAL of that LP is:
-    max   b^T lam
-    s.t.  A^T lam <= c
-
-where lam in R^m is the vector of dual variables (one per observational
-constraint), and the constraint  A^T lam <= c  has one row per latent type
-(n rows, potentially n >> m).
-
-The bottleneck in the central-path algorithm is evaluating  A^T lam  at
-every iteration.  Both examples have DAG structure that lets us replace the
-explicit (m x n) matrix multiplication with closed-form operations.
-
-
-Latent types — mathematical meaning
--------------------------------------
-
-IV_cont: (Tt, Yt)
-~~~~~~~~~~~~~~~~~~
-DAG:    Z --> T --> Y
-              ^     ^
-              +--U--+
-
-The instrument Z is exogenous; U is an unmeasured confounder.
-Structural equations (after discretising to k bins each):
-    T = f_T(Z, U)      Y = f_Y(T, U)
-
-A latent type (Tt, Yt) encodes the full counterfactual schedule of a
-unit, i.e. its response to every possible value of (Z, T):
-
-    Tt in {0,1}^k   -- Treatment response function.
-                       Tt[z] = T that this unit would choose if Z = z.
-                       Encodes how the unit's treatment selection responds
-                       to each of the k instrument bins.
-                       There are 2^k such functions (all maps {0..k-1}->{0,1}).
-
-    Yt = (y0, y1)   -- Potential outcomes.
-                       Yt[t] = Y that this unit would realise under treatment t.
-                       There are k^2 such pairs.
-
-Together (Tt, Yt) determines the realised (T, Y) for any value of Z:
-    T_obs(z) = Tt[z]
-    Y_obs(z) = Yt[Tt[z]]
-
-And the individual causal effect is  Yt[1] - Yt[0].
-The LP variable  p[Tt, Yt] >= 0  is the population share of this type.
-
-Constraint matrix A (shape m x n, with m = 2k^2+1, n = 2^k * k^2):
-    A[z,t,y][Tt,Yt] = 1{Tt[z]=t} * 1{Yt[t]=y}
-    "Does unit-type (Tt,Yt) realise (T=t, Y=y) when Z=z?"
-
-Objective:
-    c[Tt,Yt] = Yt[1] - Yt[0]   (individual causal effect)
-
-RHS:
-    b[z,t,y] = P_data(T=t, Y=y | Z=z)
-
-
-Edu_vs_Voting: (x, d, (y0, y1))
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-DAG:    X --> D --> Y
-              ^     ^
-              +--U--+   (X also -> Y directly)
-
-No instrument. Latent type includes the covariate x and realised treatment d
-because selection into treatment is confounded (d is correlated with U):
-
-    x  in {0,..,kx-1}   -- Observed covariate bin.  Fixed attribute of unit.
-
-    d  in {0,1}          -- Realised treatment for this unit.
-                            Including d in the type captures selection:
-                            p[x,d,y0,y1] = P(X=x, D=d, Y(0)=y0, Y(1)=y1)
-                            allows P(D|X,Y(0),Y(1)) to be non-trivial.
-
-    (y0, y1)             -- Potential outcomes Y(0) and Y(1).
-
-The observed outcome is Y = Yt[d] (the potential outcome for the realised d).
-
-Constraint matrix A (shape m x n, m = kx*2*ky+1, n = kx*2*ky^2):
-    A[x',d',y'][x,d,(y0,y1)] = 1{x=x'} * 1{d=d'} * 1{Yt[d]=y'}
-    "Does latent type (x,d,y0,y1) realise Y=y' under treatment d'?"
-
-Key observation: each latent type touches EXACTLY ONE observational
-constraint (the one with x'=x, d'=d, y'=Yt[d]).  So A^T lam reduces
-to a single gather operation.
-
-Objective:
-    c[x,d,y0,y1] = y_centers[y1] - y_centers[y0]
+What changed vs neural_dual_solver2:
+    - A.t() @ lam   →   lp.AtLam(lam)          (matrix-free, O(k^2·2^k) or O(n))
+    - b @ lam        →   lp.b_lam(lam)          (O(m) dot product)
+    - c tensor       →   lp.c  (sign-flipped)   (precomputed, never stored as dense A)
+    - feature grid   →   lp.feats               (precomputed in ImplicitLP)
+    - No build_constraints_IV/EV call needed     (A and b never materialised)
 """
 
 import argparse
@@ -106,16 +29,12 @@ import time
 import wandb
 from itertools import product
 
-from Data.IV_cont.LP_construction import generate_data_IV, empirical_distribution_IV
-from Data.IV_cont.utils import plot_dual_heatmap
+from Data.IV_cont.LP_construction  import generate_data_IV, empirical_distribution_IV
+from Data.IV_cont.utils            import plot_dual_heatmap
 from Data.Edu_vs_Voting.LP_construction import (
     generate_data_EV, empirical_distribution_EV,
 )
-
-
-# ======================================================================
-# Implicit LP operators  (no matrix A ever allocated)
-# ======================================================================
+# from implicit_neural_solver import ImplicitLP_IV, ImplicitLP_EV
 
 class ImplicitLP_IV:
     """
@@ -282,21 +201,27 @@ class ImplicitLP_EV:
 
 
 # ======================================================================
-# Neural network  (identical role to DualModel2 in original solver)
+# Hyper-parameters (same as neural_dual_solver2)
+# ======================================================================
+
+EPS_TOL = 0
+
+
+# ======================================================================
+# Neural network  (identical to neural_dual_solver2.DualNet / DualModel)
 # ======================================================================
 
 class DualNet(nn.Module):
     """
-    Maps  feats (m, 3)  ->  (lam_pos (m,), lam_neg (m,))
-    so that  lam = lam_pos - lam_neg  is an unconstrained real vector.
-    The 3-dim feature encodes the "coordinate" of each dual variable.
+    Single-output network: feats (m, 3) → lam_pos (m,).
+    lam = lam_pos  (non-negative representation; upper bound flips sign of c).
     """
-    def __init__(self, hidden=32, num_layers=2):
+    def __init__(self, i=3, h=10, num_layers=2):
         super().__init__()
-        layers = [nn.Linear(3, hidden), nn.LayerNorm(hidden), nn.Tanh()]
+        layers = [nn.Linear(i, h), nn.LayerNorm(h), nn.Tanh()]
         for _ in range(num_layers - 1):
-            layers += [nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.Tanh()]
-        layers.append(nn.Linear(hidden, 2))
+            layers += [nn.Linear(h, h), nn.LayerNorm(h), nn.Tanh()]
+        layers.append(nn.Linear(h, 1))
         self.net = nn.Sequential(*layers)
         self.apply(self._init)
 
@@ -306,359 +231,372 @@ class DualNet(nn.Module):
             nn.init.normal_(m.weight, 0.0, 0.05)
             nn.init.normal_(m.bias,   0.0, 0.05)
 
+    def forward(self, x):
+        return self.net(x)[:, 0]   # (m,)
+
+
+class DualModel(nn.Module):
+    def __init__(self, i=3, h=6, num_layers=2):
+        super().__init__()
+        self.net = DualNet(i, h, num_layers)
+
     def forward(self, feats):
-        out = self.net(feats)          # (m, 2)
-        return out[:, 0], out[:, 1]   # lam_pos, lam_neg
+        return self.net(feats)     # (m,) — lam_pos
+
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 # ======================================================================
-# Core solver
+# Core solver  (mirrors neural_dual_solver2.solve_dual_nn)
 # ======================================================================
 
-def solve_dual_implicit(
-    lp,                        # ImplicitLP_IV or ImplicitLP_EV
-    upper        = False,
-    steps_s1     = 30_000,     # Stage 1: aug-Lagrangian feasibility
-    steps_s2     = 30_000,     # Stage 2: log-barrier central path
-    lr_s1        = 5e-3,
-    lr_s2        = 5e-4,
-    hidden       = 32,
-    num_layers   = 2,
-    interior_margin = 1e-3,
-    max_backtrack   = 30,
-    name         = "run",
-    seed         = 0,
+def solve_dual_nn(
+    lp,
+    upper            = False,
+    steps            = 150_000,
+    lr               = 1e-5,
+    hidden           = 5,
+    layers           = 2,
+    interior_margin  = 1e-3,
+    max_backtrack    = 50,
+    warm_start_steps = 2000,
+    name             = "run",
 ):
     """
-    Two-stage implicit neural dual solver.
-
-    Stage 1 — Augmented Lagrangian
-        Find a strictly feasible interior point  lam0  with
-        min_i slack_i > 0  using a penalty / aug-Lagrangian approach.
-        The NN is trained to output lam0.
-
-    Stage 2 — Log-barrier central path
-        Initialised from Stage 1 weights.  Maximises  b^T lam  subject to
-        all dual constraints staying strictly positive via the barrier:
-            loss = -b^T lam  +  mu * (-mean log(c - A^T lam))
-        mu is annealed from 1 down towards 0.
-
-    In both stages  A^T lam  is evaluated via  lp.AtLam(lam)  without
-    ever forming the (m x n) matrix A.
+    Parameters
+    ----------
+    lp               : ImplicitLP_IV or ImplicitLP_EV
+    upper            : if True, solve for the upper bound (flips sign of c)
+    steps            : central-path training steps
+    lr               : learning rate for central-path phase
+    hidden, layers   : DualNet architecture
+    interior_margin  : target minimum slack during warm-start
+    max_backtrack    : maximum backtracking iterations per step
+    warm_start_steps : warm-start steps before central path
+    name             : run name for wandb
     """
-    torch.manual_seed(seed)
+    if wandb.run is not None:
+        wandb.finish()
+
+    bound_tag = "UpperBound" if upper else "LowerBound"
+    try:
+        wandb.init(
+            project = "NeuralDualSolver_Implicit",
+            name    = f"{name}_{bound_tag}",
+            config  = {"steps": steps, "lr": lr,
+                       "hidden": hidden, "layers": layers,
+                       "n": lp.n, "m": lp.m},
+            reinit  = True,
+        )
+    except Exception:
+        wandb.init(mode="disabled", reinit=True)
+
     device = lp.device
 
-    sign = -1.0 if upper else 1.0   # upper bound flips objective sign
-    c    = sign * lp.c              # (n,) — modified objective for upper bound
+    # upper bound: flip sign of c so we still maximise b^T lam
+    sign = -1 if upper else 1
+    c    = sign * lp.c      # (n,) — on device, no copy of A
 
-    # ----------------------------------------------------------------
-    # Stage 1: Augmented Lagrangian — find strictly feasible lam
-    # ----------------------------------------------------------------
-    print(f"\n=== Stage 1: feasible interior point  ({steps_s1} steps) ===")
-    print(f"  |lam| = {lp.m}   |dual constraints| = {lp.n}")
+    # ------------------------------------------------------------------
+    # Build model
+    # ------------------------------------------------------------------
+    model = DualModel(i=lp.feats.shape[1], h=hidden, num_layers=layers).to(device)
+    print(f"\nDual variables (m): {lp.m}")
+    print(f"Dual constraints (n): {lp.n}")
+    print(f"NN parameters: {count_params(model)}")
+    print(f"Compression ratio: {lp.m / count_params(model):.2f}x")
 
-    model = DualNet(hidden, num_layers).to(device)
-    opt1  = torch.optim.Adam(model.parameters(), lr=lr_s1)
-    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, steps_s1)
+    # ------------------------------------------------------------------
+    # Warm-start: push all slacks above interior_margin
+    # ------------------------------------------------------------------
+    model.train()
+    opt_ws = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
-    # Augmented-Lagrangian multipliers (one per dual constraint)
-    nu  = torch.zeros(lp.n, device=device)
-    rho = 1.0
+    for _ in range(warm_start_steps):
+        lam   = model(lp.feats)               # (m,)
+        AtL   = lp.AtLam(lam)                 # (n,) — matrix-free
+        slack = c - AtL                       # (n,)
 
-    for step in range(steps_s1):
-        lam_pos, lam_neg = model(lp.feats)
-        lam  = lam_pos - lam_neg
+        violation = torch.relu(interior_margin - slack)
+        loss      = violation.max()
 
-        AtL   = lp.AtLam(lam)             # (n,) — matrix-free
-        slack = c - AtL                   # (n,) — positive = feasible
-
-        # violation: how much each constraint is violated
-        viol  = torch.relu(-slack)        # (n,) >= 0
-
-        dual_obj = sign * lp.b_lam(lam)
-
-        # Augmented Lagrangian loss:  maximise dual_obj  subject to  slack >= 0
-        loss = -dual_obj \
-             + (nu * viol).sum() \
-             + rho * (viol ** 2).sum()
-
-        opt1.zero_grad()
+        opt_ws.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt1.step()
-        sched1.step()
+        opt_ws.step()
 
-        # Dual variable update (sub-gradient ascent on nu)
-        with torch.no_grad():
-            nu = torch.clamp(nu + rho * viol, min=0.0)
-
-        # Increase penalty every 1000 steps
-        if step % 1000 == 0:
-            rho = min(rho * 1.5, 1e5)
-            if step % 5000 == 0:
-                with torch.no_grad():
-                    print(
-                        f"  step {step:6d} | "
-                        f"dual {dual_obj.item():+.4f} | "
-                        f"min slack {slack.min().item():+.6f} | "
-                        f"violations {(viol > 0).sum().item()}"
-                    )
-
-    # Check interior point quality
     with torch.no_grad():
-        lam_pos, lam_neg = model(lp.feats)
-        lam_s1 = lam_pos - lam_neg
-        slack_s1 = c - lp.AtLam(lam_s1)
-        print(f"  Stage 1 done | min slack = {slack_s1.min().item():+.6e}")
-        if slack_s1.min().item() <= 0:
-            print("  WARNING: not strictly interior after Stage 1.")
+        lam   = model(lp.feats)
+        slack = c - lp.AtLam(lam)
+        print(f"[Warm-start] min slack = {slack.min().item():.6e}  "
+              f"violations = {(slack < 0).sum().item()}")
 
-    # Save Stage 1 weights
-    tag = "upper" if upper else "lower"
-    ckpt_path = f"{tag}_stage1_implicit.pt"
-    torch.save(model.state_dict(), ckpt_path)
+    # ------------------------------------------------------------------
+    # Central-path loop  (identical logic to neural_dual_solver2)
+    # ------------------------------------------------------------------
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
 
-    # ----------------------------------------------------------------
-    # Stage 2: Log-barrier central path
-    # ----------------------------------------------------------------
-    print(f"\n=== Stage 2: central path  ({steps_s2} steps) ===")
+    max_mu = 1e-3
+    t      = 0
+    mu     = 1.0 / (t + 1)
 
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    opt2   = torch.optim.Adam(model.parameters(), lr=lr_s2)
-    sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, steps_s2)
-
-    mu      = 1.0
-    mu_floor = 1e-6
-
-    best_obj = -1e9 if not upper else 1e9
-    best_state = {k: v.clone() for k, v in model.state_dict().items()}
-
-    for step in range(steps_s2):
-        # --- save state for backtracking ---
+    for step in range(steps):
+        # save state for backtracking
         prev_state = {k: v.clone() for k, v in model.state_dict().items()}
-        prev_lrs   = [g['lr'] for g in opt2.param_groups]
+        lr_prev    = [g["lr"] for g in optimizer.param_groups]
 
-        # --- forward ---
-        lam_pos, lam_neg = model(lp.feats)
-        lam   = lam_pos - lam_neg
-        AtL   = lp.AtLam(lam)        # matrix-free  A^T lam
-        slack = c - AtL              # (n,)
+        # ---- forward ----
+        lam   = model(lp.feats)               # (m,)
+        AtL   = lp.AtLam(lam)                 # (n,) — matrix-free
+        slack = c - AtL                       # (n,)
 
         if (slack <= 0).any():
-            slack = torch.clamp(slack, min=interior_margin)
+            print(f"[step {step}] infeasible before step, "
+                  f"min_slack={slack.min().item():.6e}")
 
-        barrier  = -torch.log(slack).mean()
-        dual_obj = lp.b_lam(lam)
-        loss     = -sign * dual_obj + mu * barrier
-
-        opt2.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt2.step()
-        sched2.step()
-
-        # --- feasibility check + backtracking ---
-        with torch.no_grad():
-            lam_pos_new, lam_neg_new = model(lp.feats)
-            lam_new   = lam_pos_new - lam_neg_new
-            slack_new = c - lp.AtLam(lam_new)
-
-        if (slack_new <= 0).any():
+        # ---- backtracking if infeasible ----
+        if (slack <= 0).any():
             success = False
             for _ in range(max_backtrack):
                 model.load_state_dict(prev_state)
-                for g in opt2.param_groups:
-                    g['lr'] *= 0.5
+                for g in optimizer.param_groups:
+                    g["lr"] *= 0.8
 
-                lam_pos_bt, lam_neg_bt = model(lp.feats)
-                lam_bt   = lam_pos_bt - lam_neg_bt
-                slack_bt = c - lp.AtLam(lam_bt)
-                slack_bt = torch.clamp(slack_bt, min=interior_margin)
+                lam_bt   = model(lp.feats)
+                AtL_bt   = lp.AtLam(lam_bt)
+                # add interior_margin shift (same as neural_dual_solver2)
+                slack_bt = c - AtL_bt + interior_margin
 
                 barrier_bt  = -torch.log(slack_bt).mean()
                 dual_obj_bt = lp.b_lam(lam_bt)
-                loss_bt     = -sign * dual_obj_bt + mu * barrier_bt
+                loss_bt     = -dual_obj_bt + mu * barrier_bt
 
-                opt2.zero_grad()
+                optimizer.zero_grad()
                 loss_bt.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt2.step()
+                optimizer.step()
 
                 with torch.no_grad():
-                    lam_pos_bt, lam_neg_bt = model(lp.feats)
-                    lam_bt   = lam_pos_bt - lam_neg_bt
+                    lam_bt   = model(lp.feats)
                     slack_bt = c - lp.AtLam(lam_bt)
+
                 if (slack_bt > 0).all():
-                    success = True
+                    success    = True
+                    slack      = slack_bt
+                    dual_obj   = lp.b_lam(lam_bt)
                     break
 
             if not success:
-                print(f"  [step {step}] backtracking failed — stopping Stage 2.")
+                smallest5 = torch.topk(slack_bt, 5, largest=False).values
+                print(
+                    f"[step {step}] backtracking failed — stopping.\n"
+                    f"  dual {sign * dual_obj_bt.item():.4f} | "
+                    f"min slack {slack_bt.min().item():.6f} | "
+                    f"top5 {smallest5.detach().cpu().numpy()}"
+                )
                 model.load_state_dict(prev_state)
-                for g, lr in zip(opt2.param_groups, prev_lrs):
-                    g['lr'] = lr
+                for g, old_lr in zip(optimizer.param_groups, lr_prev):
+                    g["lr"] = old_lr
                 break
 
-        # --- anneal barrier parameter ---
-        mu = max(10.0 / (step + 1), mu_floor)
+        # ---- barrier loss (uses .min() as in neural_dual_solver2) ----
+        barrier  = -torch.log(slack).min()
+        dual_obj = lp.b_lam(lam)
+        loss     = -dual_obj + mu * barrier
 
-        # --- track best feasible solution ---
-        with torch.no_grad():
-            lam_pos_ev, lam_neg_ev = model(lp.feats)
-            lam_ev   = lam_pos_ev - lam_neg_ev
-            obj_ev   = lp.b_lam(lam_ev).item()
-            if (c - lp.AtLam(lam_ev) > 0).all():
-                if (not upper and obj_ev > best_obj) or (upper and obj_ev < best_obj):
-                    best_obj   = obj_ev
-                    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
 
+        # ---- adaptive mu schedule (identical to neural_dual_solver2) ----
+        interval = (max(2500, int(100_000 / (t + 1)))
+                    if mu > max_mu * 10 else 2000)
+        if step % interval == 0:
+            t  += 1
+            mu  = max(1.0 / t, max_mu)
+
+        # ---- logging ----
         if step % 1000 == 0:
             with torch.no_grad():
-                lam_pos_l, lam_neg_l = model(lp.feats)
-                lam_l   = lam_pos_l - lam_neg_l
-                slack_l = c - lp.AtLam(lam_l)
-                obj_l   = lp.b_lam(lam_l).item()
+                wandb.log({
+                    "step":      step,
+                    "dual_obj":  (sign * dual_obj).item(),
+                    "min_slack": slack.min().item(),
+                    "max_slack": slack.max().item(),
+                    "mean_slack":slack.mean().item(),
+                    "num_active":(slack < 1e-4).sum().item(),
+                    "loss":      loss.item(),
+                    "mu":        mu,
+                })
+            if step % 2000 == 0:
+                smallest5 = torch.topk(slack, 5, largest=False).values
                 print(
-                    f"  step {step:6d} | "
-                    f"dual {obj_l:+.4f} | "
-                    f"min slack {slack_l.min().item():+.6f} | "
-                    f"active {(slack_l < 1e-4).sum().item()} | "
-                    f"mu {mu:.2e}"
+                    f"step {step:7d} | "
+                    f"dual {sign * dual_obj.item():+.4f} | "
+                    f"min slack {slack.min().item():+.6f} | "
+                    f"max slack {slack.max().item():+.6f} | "
+                    f"top5 {smallest5.detach().cpu().numpy()} | "
+                    f"mu {mu:.3e}"
                 )
 
-    # --- final evaluation from best state ---
-    model.load_state_dict(best_state)
+    # ------------------------------------------------------------------
+    # Final readout
+    # ------------------------------------------------------------------
     with torch.no_grad():
-        lam_pos_f, lam_neg_f = model(lp.feats)
-        lam_f   = lam_pos_f - lam_neg_f
-        dual_val = lp.b_lam(lam_f).item()
-        slack_f  = c - lp.AtLam(lam_f)
-        nu_f     = slack_f.min().item()
+        lam_final = model(lp.feats)
+        slack_f   = c - lp.AtLam(lam_final)
+        nu        = slack_f.min().item()
 
-    return (
-        lam_pos_f.cpu().numpy(),
-        lam_neg_f.cpu().numpy(),
-        dual_val,
-        nu_f,
-    )
+    return lam_final.detach().cpu().numpy(), nu
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+
+def get_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--name",             type=str,   default="IV_cont")
+    p.add_argument("--distribution_gen", type=str,   default="generate")
+    p.add_argument("--k",                type=int,   default=10)
+    p.add_argument("--hidden",           type=int,   default=5)
+    p.add_argument("--layers",           type=int,   default=2)
+    p.add_argument("--steps",            type=int,   default=150_000)
+    p.add_argument("--warm_start",       type=int,   default=2000)
+    p.add_argument("--lr_lower",         type=float, default=5e-3)
+    p.add_argument("--lr_upper",         type=float, default=5e-4)
+    p.add_argument("--n_pts",            type=int,   default=10_000)
+    p.add_argument("--seed",             type=int,   default=2020)
+    return p.parse_args()
 
 
 # ======================================================================
 # Main
 # ======================================================================
 
-def get_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--name",              type=str,   default="IV_cont")
-    p.add_argument("--distribution_gen",  type=str,   default="generate")
-    p.add_argument("--k",                 type=int,   default=8)
-    p.add_argument("--hidden",            type=int,   default=32)
-    p.add_argument("--layers",            type=int,   default=2)
-    p.add_argument("--steps_s1",          type=int,   default=30_000)
-    p.add_argument("--steps_s2",          type=int,   default=30_000)
-    p.add_argument("--lr_s1",             type=float, default=5e-3)
-    p.add_argument("--lr_s2",             type=float, default=5e-4)
-    p.add_argument("--n_pts",             type=int,   default=10_000)
-    p.add_argument("--seed",              type=int,   default=2022)
-    return p.parse_args()
-
-
 if __name__ == "__main__":
-    args   = get_args()
-    SEED   = args.seed
+    args = get_args()
+    SEED = args.seed
+    print("Seed:", SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
+
+    k    = args.k
+    name = args.name
+    dist = args.distribution_gen
+    n    = args.steps
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    k    = args.k
-    name = args.name
+    wandb_name = name + f"_k{k}_steps{n}_h{args.hidden}_l{args.layers}"
 
     # ------------------------------------------------------------------
-    # Build implicit LP operator
+    # Build implicit LP operator  (no A matrix ever allocated)
     # ------------------------------------------------------------------
     if name == "IV_cont":
-        if args.distribution_gen == "generate":
-            print("Generating IV data...")
+        if dist == "generate":
+            print("Generating data...")
             data = generate_data_IV(args.n_pts, lam=0.5)
             P    = empirical_distribution_IV(data, k)
+        elif dist == "pre-load":
+            print("Loading saved distribution...")
+            paths = {6: "./Data/IV_cont/P6.npy",
+                     8: "./Data/IV_cont/P8.npy",
+                     10: "./Data/IV_cont/P10.npy"}
+            if k not in paths:
+                raise FileNotFoundError(f"No pre-saved P for k={k}")
+            P = np.load(paths[k])
         else:
-            P = np.load("./Data/IV_cont/P8.npy")
+            raise ValueError(f"Unknown distribution_gen: {dist}")
 
         lp = ImplicitLP_IV(P, k, device=device)
-        print(f"IV_cont  |  k={k}  |  n={lp.n}  |  m={lp.m}")
+        print(f"\nIV_cont  k={k}  n={lp.n}  m={lp.m}")
 
     elif name == "Edu_vs_Voting":
-        from Data.Edu_vs_Voting.LP_construction import empirical_distribution_EV
         kx = ky = k
-        print("Generating Edu_vs_Voting data...")
-        data, Y0, Y1 = generate_data_EV(args.n_pts, tau=0.5, seed=SEED)
-        print(f"True ATE: {np.mean(Y1 - Y0):.4f}")
-        P, x_bins, y_bins = empirical_distribution_EV(data, kx, ky)
+        if dist == "generate":
+            print("Generating data...")
+            data, Y0, Y1 = generate_data_EV(args.n_pts, tau=0.5, seed=SEED)
+            print(f"True ATE: {np.mean(Y1 - Y0):.4f}")
+            P, x_bins, y_bins = empirical_distribution_EV(data, kx, ky)
+        elif dist == "pre-load":
+            print("Loading saved distribution...")
+            paths = {12: "./Data/Edu_vs_Voting/P12_EV.npz",
+                     16: "./Data/Edu_vs_Voting/P16_EV.npz"}
+            if k not in paths:
+                raise FileNotFoundError(f"No pre-saved P for k={k}")
+            data_np = np.load(paths[k])
+            P, x_bins, y_bins = data_np["P"], data_np["x_bins"], data_np["y_bins"]
+        else:
+            raise ValueError(f"Unknown distribution_gen: {dist}")
+
         lp = ImplicitLP_EV(P, kx, ky, y_bins, device=device)
-        print(f"Edu_vs_Voting  |  k={k}  |  n={lp.n}  |  m={lp.m}")
+        print(f"\nEdu_vs_Voting  k={k}  n={lp.n}  m={lp.m}")
 
     else:
         raise ValueError(f"Unknown name: {name}")
 
     # ------------------------------------------------------------------
-    # Benchmark: implicit vs explicit A^T @ lam
+    # A^T @ lam benchmark
     # ------------------------------------------------------------------
-    print("\n--- A^T @ lam benchmark ---")
-    lam_test = torch.randn(lp.m, device=device)
-
-    N_BENCH = 200
-    t0 = time.time()
-    for _ in range(N_BENCH):
-        _ = lp.AtLam(lam_test)
-    t_implicit = (time.time() - t0) / N_BENCH * 1000
-    print(f"  implicit:  {t_implicit:.3f} ms / call")
+    print("\n--- A^T @ lam benchmark (200 calls) ---")
+    _lam = torch.randn(lp.m, device=device)
+    _t0  = time.time()
+    for _ in range(200):
+        _ = lp.AtLam(_lam)
+    print(f"  {(time.time() - _t0) / 200 * 1000:.3f} ms / call")
+    del _lam
 
     # ------------------------------------------------------------------
-    # Solve lower bound
+    # Solve
     # ------------------------------------------------------------------
     print("\n" + "="*60)
     t_start = time.time()
 
-    lam_L_pos, lam_L_neg, dual_L, nu_L = solve_dual_implicit(
+    print("Solving LOWER bound...")
+    lam_L, nu_L = solve_dual_nn(
         lp,
-        upper     = False,
-        steps_s1  = args.steps_s1,
-        steps_s2  = args.steps_s2,
-        lr_s1     = args.lr_s1,
-        lr_s2     = args.lr_s2,
-        hidden    = args.hidden,
-        num_layers= args.layers,
-        name      = name,
-        seed      = SEED,
+        upper            = False,
+        steps            = n,
+        lr               = args.lr_lower,
+        hidden           = args.hidden,
+        layers           = args.layers,
+        interior_margin  = 1e-3,
+        max_backtrack    = 50,
+        warm_start_steps = args.warm_start,
+        name             = wandb_name,
     )
 
-    # ------------------------------------------------------------------
-    # Solve upper bound
-    # ------------------------------------------------------------------
-    lam_U_pos, lam_U_neg, dual_U, nu_U = solve_dual_implicit(
+    print("\nSolving UPPER bound...")
+    lam_U, nu_U = solve_dual_nn(
         lp,
-        upper     = True,
-        steps_s1  = args.steps_s1,
-        steps_s2  = args.steps_s2,
-        lr_s1     = args.lr_s1,
-        lr_s2     = args.lr_s2,
-        hidden    = args.hidden,
-        num_layers= args.layers,
-        name      = name,
-        seed      = SEED,
+        upper            = True,
+        steps            = n,
+        lr               = args.lr_upper,
+        hidden           = args.hidden,
+        layers           = args.layers,
+        interior_margin  = 1e-3,
+        max_backtrack    = 50,
+        warm_start_steps = args.warm_start,
+        name             = wandb_name,
     )
 
     t_end = time.time()
 
     # ------------------------------------------------------------------
-    # Final bounds
+    # Compute bounds from the returned lam vectors
     # ------------------------------------------------------------------
-    b_np = np.concatenate([P.reshape(-1), [1.0]])   # (m,)
-    lower =  (b_np * (lam_L_pos - lam_L_neg)).sum()
-    upper = -(b_np * (lam_U_pos - lam_U_neg)).sum()
+    # b is stored inside lp as lp.b_obs (shape (k,2,k) or (kx,2,ky)) + norm=1
+    # b^T lam = (P * lam_obs).sum() + lam_norm  — same as lp.b_lam but on numpy
+    b_flat = np.concatenate([P.reshape(-1), [1.0]])   # (m,)
+
+    lower =  (b_flat * lam_L).sum()
+    upper = -(b_flat * lam_U).sum()
 
     print("\n" + "="*60)
     print("BOUNDS")
@@ -666,11 +604,8 @@ if __name__ == "__main__":
     print(f"  Upper : {upper:.4f}   (nu = {nu_U:.2e})")
     if name == "IV_cont":
         print("  True ATE = 3.0")
-        labels_plot = list(product([0,1], repeat=k))
-        plot_dual_heatmap(lam_L_pos - lam_L_neg, [], k,
-                          f"Lower  {lower:.4f}")
-        plot_dual_heatmap(lam_U_pos - lam_U_neg, [], k,
-                          f"Upper  {upper:.4f}")
+        plot_dual_heatmap(lam_L, [], k, f"Lower {lower:.4f}")
+        plot_dual_heatmap(lam_U, [], k, f"Upper {upper:.4f}")
     elif name == "Edu_vs_Voting":
         print("  True ATE = 0.5")
     print(f"  Wall time: {t_end - t_start:.1f}s")

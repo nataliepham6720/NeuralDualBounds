@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from itertools import product
 from scipy.stats import truncnorm
+from collections import defaultdict
 
 # ============================================================
 # Continuous IV Data Generator
@@ -96,3 +97,36 @@ def build_constraints_IV(P,k):
     c=[Yt[1]-Yt[0] for Tt in T_types for Yt in Y_types]
 
     return np.array(A), np.array(b), np.array(c), labels
+
+
+def prune_duplicate_columns(A, c):
+
+    groups = defaultdict(list)
+
+    # group indices by identical columns
+    for i in range(A.shape[1]):
+        pattern = tuple(A[:, i])
+        groups[pattern].append(i)
+
+    keep = []
+
+    for pattern, idxs in groups.items():
+
+        # choose smallest-cost representative
+        costs = [c[i] for i in idxs]
+        best = idxs[np.argmin(costs)]
+
+        keep.append(best)
+
+        print(
+            f"group={idxs}, "
+            f"costs={[c[i] for i in idxs]}, "
+            f"keep={best}"
+        )
+
+    keep = sorted(keep)
+
+    A_new = A[:, keep]
+    c_new = c[keep]
+
+    return A_new, c_new, keep
