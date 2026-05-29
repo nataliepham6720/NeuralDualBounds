@@ -314,7 +314,7 @@ def solve_dual_nn(
     model.train()
     opt_ws = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
-    for _ in range(warm_start_steps):
+    for ws_step in range(warm_start_steps):
         lam   = model(lp.feats)               # (m,)
         AtL   = lp.AtLam(lam)                 # (n,) — matrix-free
         slack = c - AtL                       # (n,)
@@ -325,6 +325,11 @@ def solve_dual_nn(
         opt_ws.zero_grad()
         loss.backward()
         opt_ws.step()
+
+        # stop early once every slack exceeds interior_margin
+        if loss.item() == 0.0:
+            print(f"[Warm-start] converged at step {ws_step} — all slacks > interior_margin")
+            break
 
     with torch.no_grad():
         lam   = model(lp.feats)
@@ -342,11 +347,11 @@ def solve_dual_nn(
     t      = 0
     mu     = 1.0 / (t + 1)
 
-    for step in range(steps):
-        # save state for backtracking
-        prev_state = {k: v.clone() for k, v in model.state_dict().items()}
-        lr_prev    = [g["lr"] for g in optimizer.param_groups]
+    # last confirmed-feasible checkpoint — updated only when slack > 0 before a step
+    last_feasible_state = {k: v.clone() for k, v in model.state_dict().items()}
+    last_feasible_lr    = [g["lr"] for g in optimizer.param_groups]
 
+    for step in range(steps):
         # ---- forward ----
         lam   = model(lp.feats)               # (m,)
         AtL   = lp.AtLam(lam)                 # (n,) — matrix-free
@@ -360,9 +365,10 @@ def solve_dual_nn(
         if (slack <= 0).any():
             success = False
             for _ in range(max_backtrack):
-                model.load_state_dict(prev_state)
-                for g in optimizer.param_groups:
-                    g["lr"] *= 0.8
+                # restore from last CONFIRMED feasible state, not current infeasible one
+                model.load_state_dict(last_feasible_state)
+                for g, old_lr in zip(optimizer.param_groups, last_feasible_lr):
+                    g["lr"] = old_lr * 0.8
 
                 lam_bt   = model(lp.feats)
                 AtL_bt   = lp.AtLam(lam_bt)
@@ -383,10 +389,17 @@ def solve_dual_nn(
                     slack_bt = c - lp.AtLam(lam_bt)
 
                 if (slack_bt > 0).all():
-                    success    = True
-                    slack      = slack_bt
-                    dual_obj   = lp.b_lam(lam_bt)
+                    success  = True
+                    slack    = slack_bt
+                    dual_obj = lp.b_lam(lam_bt)
+                    # update feasible checkpoint and shrink lr permanently
+                    last_feasible_state = {k: v.clone() for k, v in model.state_dict().items()}
+                    last_feasible_lr    = [g["lr"] for g in optimizer.param_groups]
                     break
+                # shrink the lr used in the next backtrack attempt
+                for g in optimizer.param_groups:
+                    g["lr"] *= 0.8
+                last_feasible_lr = [g["lr"] for g in optimizer.param_groups]
 
             if not success:
                 smallest5 = torch.topk(slack_bt, 5, largest=False).values
@@ -396,10 +409,17 @@ def solve_dual_nn(
                     f"min slack {slack_bt.min().item():.6f} | "
                     f"top5 {smallest5.detach().cpu().numpy()}"
                 )
-                model.load_state_dict(prev_state)
-                for g, old_lr in zip(optimizer.param_groups, lr_prev):
+                model.load_state_dict(last_feasible_state)
+                for g, old_lr in zip(optimizer.param_groups, last_feasible_lr):
                     g["lr"] = old_lr
                 break
+            
+            lam   = model(lp.feats)
+            slack = c - lp.AtLam(lam)
+        else:
+            # current state is feasible — checkpoint it before we step
+            last_feasible_state = {k: v.clone() for k, v in model.state_dict().items()}
+            last_feasible_lr    = [g["lr"] for g in optimizer.param_groups]
 
         # ---- barrier loss (uses .min() as in neural_dual_solver2) ----
         barrier  = -torch.log(slack).min()
@@ -467,8 +487,8 @@ def get_args():
     p.add_argument("--layers",           type=int,   default=2)
     p.add_argument("--steps",            type=int,   default=150_000)
     p.add_argument("--warm_start",       type=int,   default=2000)
-    p.add_argument("--lr_lower",         type=float, default=5e-3)
-    p.add_argument("--lr_upper",         type=float, default=5e-4)
+    p.add_argument("--lr_lower",         type=float, default=1e-5)
+    p.add_argument("--lr_upper",         type=float, default=1e-5)
     p.add_argument("--n_pts",            type=int,   default=10_000)
     p.add_argument("--seed",             type=int,   default=2020)
     return p.parse_args()
