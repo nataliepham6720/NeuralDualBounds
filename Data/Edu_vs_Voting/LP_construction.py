@@ -56,12 +56,6 @@ from itertools import product
 from collections import defaultdict
 from scipy import sparse
 
-from LP_construction import (
-    generate_data_EV,
-    discretize,
-    empirical_distribution_EV,
-)
-
 __all__ = [
     "generate_data_EV",
     "discretize",
