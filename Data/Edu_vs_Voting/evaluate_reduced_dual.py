@@ -42,8 +42,8 @@ from typing import NamedTuple
 from scipy import sparse
 from scipy.optimize import linprog
 
-from LP_construction import build_constraints_EV
-from LP_cons import (
+# from LP_construction import build_constraints_EV
+from LP_construction import (
     generate_data_EV,
     empirical_distribution_EV,
     marginal_and_conditional,
@@ -56,7 +56,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
 
 # (kx, ky) configurations reported in the table
-CONFIGS = [(3, 3), (4, 6)]
+CONFIGS = [(3,3), (3,4), (4,4)]
 
 N_POINTS = 10000
 TAU = 0.5
@@ -173,7 +173,8 @@ def solve_scip(c, A, b, sense, eps=1e-9):
 def run_primal(P, kx, ky, y_bins, backend, eps=1e-9):
     """Build + solve both senses.  See `timings` for the returned fields."""
     t0 = time.time()
-    A, b, c, _ = build_constraints_EV(P, kx, ky, y_bins)
+    A, b, c, _ = build_constraints_EV_exact(P, kx, ky, y_bins)
+    print("A", A.shape)
     t_matrix = time.time() - t0
 
     t_model = t_opt = 0.0
@@ -199,7 +200,7 @@ def build_reduced_dual(P, kx, ky, y_bins, sense):
     Compact LP for the dual.
 
     Variables, in order: lambda[x,d,y]  (2 kx ky),  t[x]  (kx),  lambda_empty.
-    Rows: 2 kx ky linear constraints + 1 aggregate.  Everything is free.
+    Rows: 2 kx ky linearized constraints + 1 aggregate.  Everything is free.
     """
     px, p_cond = marginal_and_conditional(P)
     yc = bin_centers(y_bins)
@@ -314,7 +315,7 @@ def k_label(kx, ky):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=("scip", "highs"), default="scip",
+    ap.add_argument("--backend", choices=("scip", "highs"), default="highs",
                     help="solver for the primal (the dual is always HiGHS)")
     ap.add_argument("--n", type=int, default=N_POINTS)
     ap.add_argument("--seed", type=int, default=SEED)
