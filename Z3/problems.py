@@ -2,7 +2,7 @@ import itertools
 
 import numpy as np
 
-from .main import LatentDual
+from .main import LatentDual, LiftedLP
 
 
 # ===========================================================================
@@ -19,6 +19,12 @@ class IVCont(LatentDual):
         sum_z lam[z, f_T(z), y_{f_T(z)}] + lam_norm <= s*(yv[y1] - yv[y0])
 
     Groups: one per ``z`` (every stratum hits exactly one ``(t,y)`` per ``z``).
+
+    ``yv`` (``y_values``) are the outcome values of the ``k`` Y-bins.  They
+    default to the bin *indices* ``0..k-1``, which bounds
+    ``E[bin(Y1) - bin(Y0)]`` -- not the ATE.  Pass the bin centers to bound
+    the ATE on the outcome scale; ``Z3/run_iv_cont.py`` recovers them for the
+    stored ``Data/IV_cont/P{k}.npy``.
     """
 
     def __init__(self, P, k, sign=+1, eps=0.0, y_values=None):
@@ -104,6 +110,29 @@ class IVCont(LatentDual):
             return np.array(idx, dtype=np.intp), float(self.rhs[y0, y1])
 
         return cost, read
+
+    # -- the same reduction as an LP, each max lifted ----------------------
+    def reduced_lp(self):
+        """
+        ``k^3`` epigraph variables, one per ``max`` in ``separate``::
+
+            aux[z,y0,y1] >= lam[z,0,y0],    aux[z,y0,y1] >= lam[z,1,y1]
+            sum_z aux[z,y0,y1] + lam_norm <= s*(yv[y1] - yv[y0])
+
+        ``2k^3 + k^2`` rows over ``2k^2 + 1 + k^3`` columns.
+        """
+        k = self.k
+        lp = LiftedLP(self.n)
+        aux = lp.aux(k ** 3).reshape(k, k, k)           # [z, y0, y1]
+        for z in range(k):
+            for y0 in range(k):
+                for y1 in range(k):
+                    lp.epigraph(aux[z, y0, y1], [z * 2 * k + y0])
+                    lp.epigraph(aux[z, y0, y1], [z * 2 * k + k + y1])
+        for y0 in range(k):
+            for y1 in range(k):
+                lp.leq(list(aux[:, y0, y1]) + [self.n - 1], self.rhs[y0, y1])
+        return lp
 
     def all_rows(self):
         k = self.k
@@ -253,6 +282,29 @@ class EduVsVoting(LatentDual):
             return idx, rhs
 
         return cost, read
+
+    def reduced_lp(self):
+        """
+        One epigraph variable per supported ``x``; the arm ``d`` does not
+        take is free, so its ``y`` is maximised out in closed form::
+
+            t_i >= lam[i,0,y] - min_y' C[i,y,y']
+            t_i >= lam[i,1,y] - min_y' C[i,y',y]
+            sum_i t_i + lam_norm <= 0
+
+        ``2 nx ky + 1`` rows over ``2 nx ky + 1 + nx`` columns.
+        """
+        nx, ky = self.nx, self.ky
+        lp = LiftedLP(self.n)
+        t = lp.aux(nx)
+        lo0 = self.C.min(axis=2)             # [i, y0]: best y1 for arm 0
+        lo1 = self.C.min(axis=1)             # [i, y1]: best y0 for arm 1
+        for i in range(nx):
+            for y in range(ky):
+                lp.epigraph(t[i], [i * 2 * ky + y], -lo0[i, y])
+                lp.epigraph(t[i], [i * 2 * ky + ky + y], -lo1[i, y])
+        lp.leq(list(t) + [self.n - 1], 0.0)
+        return lp
 
     def all_rows(self):
         nx, ky = self.nx, self.ky
@@ -450,6 +502,44 @@ class Mediation(LatentDual):
             return np.array(idx, dtype=np.intp), float(rhs)
 
         return cost, read
+
+    def reduced_lp(self):
+        """
+        The slot maxima of ``separate`` as six epigraph families of ``kM``::
+
+            S1[j] >= lam1[1,j,y]                          slot (1,j), plain
+            S0[j] >= lam1[0,j,y]                          slot (0,j), plain
+            U1[j] >= lam1[1,j,y] + lam0[1,j,y]            slot (1,m1),  j = m1
+            U0[j] >= lam1[0,j,y] + lam0[0,j,y]            slot (0,m0),  m0 = m1
+            Pp[j] >= lam1[0,j,y] + lam0[0,j,y] + s*vY[y]  slot (0,m0),  m0 != m1
+            Nn[j] >= lam1[0,j,y] - s*vY[y]                slot (0,m1),  m0 != m1
+
+        plus one row per ``(m0, m1)`` summing the family each slot takes and
+        ``lam_norm``, ``<= 0``.  ``6 kM kY + kM^2`` rows over ``n + 6 kM``.
+        """
+        kM, kY, s = self.kM, self.kY, self.sign
+        lp = LiftedLP(self.n)
+        S1, S0, U1, U0, Pp, Nn = (lp.aux(kM) for _ in range(6))
+        for j in range(kM):
+            for y in range(kY):
+                a0, a1 = self.i1(0, j, y), self.i1(1, j, y)
+                b0, b1 = self.i0(0, j, y), self.i0(1, j, y)
+                lp.epigraph(S1[j], [a1])
+                lp.epigraph(S0[j], [a0])
+                lp.epigraph(U1[j], [a1, b1])
+                lp.epigraph(U0[j], [a0, b0])
+                lp.epigraph(Pp[j], [a0, b0], s * self.vY[y])
+                lp.epigraph(Nn[j], [a0], -s * self.vY[y])
+        for m0 in range(kM):
+            for m1 in range(kM):
+                cols = [U1[m1]] + [S1[j] for j in range(kM) if j != m1]
+                if m0 == m1:
+                    cols += [U0[m0]] + [S0[j] for j in range(kM) if j != m0]
+                else:
+                    cols += [Pp[m0], Nn[m1]]
+                    cols += [S0[j] for j in range(kM) if j not in (m0, m1)]
+                lp.leq(cols + [self.n - 1], 0.0)
+        return lp
 
     def all_rows(self):
         kM, kY, s = self.kM, self.kY, self.sign

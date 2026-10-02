@@ -46,6 +46,55 @@ class CutPool:
 
 
 # ---------------------------------------------------------------------------
+# the reduced dual written out as an LP (each max lifted to an aux variable)
+# ---------------------------------------------------------------------------
+
+class LiftedLP:
+    """
+    ``A v <= r`` over ``v = [x, aux]``, assembled row by row.
+
+    ``x`` keeps the problem's layout (``lam`` then ``lam_norm``); ``aux`` are
+    free epigraph variables standing in for the ``max`` that ``separate``
+    evaluates.  This is the form an off-the-shelf LP solver needs -- the
+    interior-point route never builds it.
+    """
+
+    def __init__(self, n):
+        self.n = self.n_cols = int(n)
+        self._rows, self._cols, self._vals, self._rhs = [], [], [], []
+
+    @property
+    def n_rows(self):
+        return len(self._rhs)
+
+    def aux(self, count):
+        """Append ``count`` free columns; returns their indices."""
+        cols = np.arange(self.n_cols, self.n_cols + int(count))
+        self.n_cols += int(count)
+        return cols
+
+    def leq(self, cols, rhs, coefs=None):
+        """``sum_j coefs_j * v[cols_j] <= rhs``, unit coefficients by default."""
+        cols = [int(c) for c in cols]
+        coefs = [1.0] * len(cols) if coefs is None else [float(a) for a in coefs]
+        self._rows.extend([self.n_rows] * len(cols))
+        self._cols.extend(cols)
+        self._vals.extend(coefs)
+        self._rhs.append(float(rhs))
+
+    def epigraph(self, a, cols, const=0.0):
+        """``v[a] >= sum_j v[cols_j] + const``."""
+        cols = [int(c) for c in cols]
+        self.leq(cols + [int(a)], -float(const), [1.0] * len(cols) + [-1.0])
+
+    def matrix(self):
+        from scipy.sparse import coo_matrix
+        A = coo_matrix((self._vals, (self._rows, self._cols)),
+                       shape=(self.n_rows, self.n_cols)).tocsr()
+        return A, np.asarray(self._rhs, dtype=float)
+
+
+# ---------------------------------------------------------------------------
 # smooth |.| for the optional eps-slack L1 term
 # ---------------------------------------------------------------------------
 
@@ -120,6 +169,13 @@ class LatentDual(ABC):
     def all_rows(self):
         """Every stratum as a row. Optional; only the full-dual route uses it."""
         raise NotImplementedError(f"{type(self).__name__} has no all_rows()")
+
+    def reduced_lp(self):
+        """
+        The reduction as a :class:`LiftedLP`. Optional; only the
+        auxiliary-variable route uses it.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no reduced_lp()")
 
     # -- generic pieces ---------------------------------------------------
     def objective(self, x, exact_abs=True):
