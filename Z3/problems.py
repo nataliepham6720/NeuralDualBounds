@@ -2,7 +2,7 @@ import itertools
 
 import numpy as np
 
-from .core import LatentDual
+from .main import LatentDual
 
 
 # ===========================================================================
