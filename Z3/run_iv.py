@@ -1,9 +1,9 @@
 """
 IV_cont ATE bounds through every route, on the outcome scale.
 
-    python -m Z3.run_iv_cont --k 6
-    python -m Z3.run_iv_cont --k 10 --routes reduced-highs reduced-scip reduced
-    python -m Z3.run_iv_cont --k 6 --units bins     # the bin-index scale
+    python -m Z3.run_iv --k 6
+    python -m Z3.run_iv --k 10 --routes reduced-highs reduced-scip reduced
+    python -m Z3.run_iv --k 6 --routes primal reduced reduced-z3
 
 """
 
@@ -15,11 +15,11 @@ import numpy as np
 from Data.IV_cont.LP_construction import (empirical_distribution_IV,
                                           generate_data_IV)
 
-from . import problems, reference, z3_oracle
+from . import problems, reference
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROUTES = ("primal", "full-highs", "full-scip", "full-ipm",
-          "reduced-highs", "reduced-scip", "reduced")
+          "reduced-highs", "reduced-scip", "reduced", "reduced-z3")
 TRUE_ATE = 3.0
 
 
@@ -50,26 +50,24 @@ def main():
     p.add_argument("--eps", type=float, default=0.0,
                    help="slack on the observational constraints")
     p.add_argument("--routes", nargs="+", choices=ROUTES, default=None,
-                   help="default: all, minus the 2^k-sized ones above k=8")
-    p.add_argument("--z3", action="store_true",
-                   help="drive the 'reduced' route with the z3 oracle "
-                        "(slow: about 20 s per oracle call at k=6)")
+                   help="default: all but reduced-z3 (slow: about 20 s "
+                        "per oracle call at k=6), minus the 2^k-sized ones "
+                        "above k=8")
     args = p.parse_args()
 
     k = args.k
     P, edges, src = load_iv(k)
     centers = (edges[:-1] + edges[1:]) / 2
     yv = centers if args.units == "y" else None
-    routes = args.routes or tuple(r for r in ROUTES if k <= 8 or
-                                  not r.startswith(("primal", "full")))
-    oracle_kw = {"make_oracle": z3_oracle.Z3Oracle} if args.z3 else {}
+    routes = args.routes or tuple(
+        r for r in ROUTES if r != "reduced-z3" and
+        (k <= 8 or not r.startswith(("primal", "full"))))
 
     def make(sign):
         return problems.IVCont(P, k, sign=sign, eps=args.eps, y_values=yv)
 
     reference.compare(make, routes=routes, baseline=routes[0],
-                      label=f"IV_cont k={k} {src} units={args.units}",
-                      oracle_kw=oracle_kw)
+                      label=f"IV_cont k={k} {src} units={args.units}")
     w = edges[1] - edges[0]
     if args.units == "y":
         print(f"\nTRUE ATE = {TRUE_ATE:g}")
