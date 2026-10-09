@@ -24,8 +24,6 @@ class Z3Oracle:
             self.opt.set("timeout", int(timeout_ms))
         self.lam_arr = z3.Array("matrix", z3.IntSort(), z3.RealSort())
         self.cost_0 = z3.Real("cost0")
-        # the problem declares its choice variables, bounds them, and returns
-        # the symbolic objective plus a reader for the attaining stratum
         self.cost, self.read = prob.z3_model(z3, self.opt, self.lam_arr,
                                              self.cost_0)
         self.opt.maximize(self.cost)
